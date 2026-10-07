@@ -8,6 +8,8 @@ class Settings(BaseSettings):
     database_url: str
     redis_url: str
     hold_seconds: int = 300
+    payment_seconds: int = 300
+    max_payment_attempts: int = 3
 
 
 settings = Settings()
