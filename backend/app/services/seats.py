@@ -120,3 +120,15 @@ def record_declined_payment(
         row = cur.fetchone()
     conn.commit()
     return None if row is None else row[0]
+
+
+def in_payment_window(conn: psycopg.Connection, seat_id: int, user_id: str) -> bool:
+    """Read-only check for retries: is this user's payment window still open?
+    Only used to skip a pointless bank call; confirm_payment still makes the real decision."""
+    row = conn.execute(
+        "SELECT 1 FROM seats WHERE id = %s AND status = 'payment_pending' "
+        "AND held_by = %s AND hold_expires_at > now()",
+        (seat_id, user_id),
+    ).fetchone()
+    conn.commit()
+    return row is not None

@@ -12,7 +12,7 @@ SCHEMA = (Path(__file__).parent.parent / "app" / "schema.sql").read_text()
 def conn():
     with psycopg.connect(settings.database_url) as c:
         # Rebuild from scratch so schema changes always apply (wipes local data).
-        c.execute("DROP TABLE IF EXISTS seats, events")
+        c.execute("DROP TABLE IF EXISTS payments, seats, events")
         c.execute(SCHEMA)
         c.commit()
         yield c
