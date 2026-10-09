@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS seats (
     id               BIGSERIAL PRIMARY KEY,
     event_id         BIGINT NOT NULL REFERENCES events(id),
     label            TEXT NOT NULL,               -- e.g. '14B'
+    price_cents      INT NOT NULL CHECK (price_cents > 0),  -- set by us, never by the browser
     status           TEXT NOT NULL DEFAULT 'open'
                      CHECK (status IN ('open', 'held', 'payment_pending', 'sold')),
     held_by          TEXT,                        -- user holding or owning the seat

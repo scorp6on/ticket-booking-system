@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class MockBank:
-    replies: list[str]          # one per authorize call: "approve", "decline", or "timeout"
+    replies: list[str]          # one per authorize call: "approve", "decline", or "timeout"; approves once empty
     on_authorize: object = None  # optional hook, lets tests simulate time passing mid-call
     authorized: list[int] = field(default_factory=list)
     captured: list[str] = field(default_factory=list)
@@ -19,7 +19,7 @@ class MockBank:
         self.authorized.append(payment_id)
         if self.on_authorize:
             self.on_authorize()
-        reply = self.replies.pop(0)
+        reply = self.replies.pop(0) if self.replies else "approve"
         if reply == "timeout":
             raise TimeoutError
         return f"bank-{payment_id}" if reply == "approve" else None

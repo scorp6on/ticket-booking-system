@@ -132,3 +132,23 @@ def in_payment_window(conn: psycopg.Connection, seat_id: int, user_id: str) -> b
     ).fetchone()
     conn.commit()
     return row is not None
+
+
+def seat_price(conn: psycopg.Connection, seat_id: int) -> int | None:
+    """The price we charge. Always read from the database, never taken from the request."""
+    row = conn.execute("SELECT price_cents FROM seats WHERE id = %s", (seat_id,)).fetchone()
+    conn.commit()
+    return None if row is None else row[0]
+
+
+def seconds_left(conn: psycopg.Connection, seat_id: int, user_id: str) -> int | None:
+    """Seconds left on this user's hold or payment window, by the database clock.
+    Sent as a duration so a wrong clock on the buyer's computer can't skew their countdown."""
+    row = conn.execute(
+        "SELECT ceil(extract(epoch FROM hold_expires_at - now()))::int FROM seats "
+        "WHERE id = %s AND held_by = %s AND status IN ('held', 'payment_pending') "
+        "AND hold_expires_at > now()",
+        (seat_id, user_id),
+    ).fetchone()
+    conn.commit()
+    return None if row is None else row[0]

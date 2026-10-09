@@ -25,7 +25,7 @@ def seat_id(conn):
         "INSERT INTO events (name, starts_at) VALUES ('Test Show', now() + interval '1 day') RETURNING id"
     ).fetchone()[0]
     sid = conn.execute(
-        "INSERT INTO seats (event_id, label) VALUES (%s, '14B') RETURNING id", (event_id,)
+        "INSERT INTO seats (event_id, label, price_cents) VALUES (%s, '14B', 4999) RETURNING id", (event_id,)
     ).fetchone()[0]
     conn.commit()
     return sid
