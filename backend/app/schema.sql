@@ -1,7 +1,8 @@
 CREATE TABLE IF NOT EXISTS events (
     id         BIGSERIAL PRIMARY KEY,
     name       TEXT NOT NULL,
-    starts_at  TIMESTAMPTZ NOT NULL
+    starts_at  TIMESTAMPTZ NOT NULL,
+    sale_opens_at TIMESTAMPTZ NOT NULL DEFAULT now()  -- people who join the queue before this get a random place
 );
 
 CREATE TABLE IF NOT EXISTS seats (

@@ -29,3 +29,15 @@ def get_event(conn: psycopg.Connection, event_id: int) -> dict | None:
             {"id": s[0], "label": s[1], "price_cents": s[2], "status": s[3]} for s in seats
         ],
     }
+
+
+def sale_state(conn: psycopg.Connection, event_id: int) -> tuple[bool, bool] | None:
+    """(sale_open, sold_out) by the database clock, or None if there's no such event."""
+    row = conn.execute(
+        "SELECT now() >= sale_opens_at, "
+        "       NOT EXISTS (SELECT 1 FROM seats WHERE event_id = events.id AND status <> 'sold') "
+        "FROM events WHERE id = %s",
+        (event_id,),
+    ).fetchone()
+    conn.commit()
+    return None if row is None else (row[0], row[1])

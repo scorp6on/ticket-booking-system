@@ -1,29 +1,3 @@
-import pytest
-from fastapi.testclient import TestClient
-
-from app.api.routes import get_bank
-from app.main import app
-from app.services.bank import MockBank
-
-
-@pytest.fixture
-def bank():
-    return MockBank(replies=[])
-
-
-@pytest.fixture
-def client(conn, bank):  # conn first: it rebuilds the tables
-    app.dependency_overrides[get_bank] = lambda: bank
-    with TestClient(app) as c:
-        yield c
-    app.dependency_overrides.clear()
-
-
-@pytest.fixture
-def event_id(conn, seat_id):
-    return conn.execute("SELECT event_id FROM seats WHERE id = %s", (seat_id,)).fetchone()[0]
-
-
 def as_user(user_id, key=None):
     headers = {"X-User-Id": user_id}
     if key:
@@ -59,9 +33,9 @@ def test_unknown_event_is_404(client):
 
 # --- POST /seats/{id}/claim ---
 
-def test_claim_then_someone_else_gets_409(client, event_id, seat_id):
-    first = client.post(f"/seats/{seat_id}/claim", headers=as_user("alice"))
-    second = client.post(f"/seats/{seat_id}/claim", headers=as_user("bob"))
+def test_claim_then_someone_else_gets_409(client, event_id, seat_id, admitted):
+    first = client.post(f"/seats/{seat_id}/claim", headers=admitted("alice"))
+    second = client.post(f"/seats/{seat_id}/claim", headers=admitted("bob"))
 
     assert (first.status_code, first.json()) == (200, {"seconds_left": 300})
     assert (second.status_code, second.json()) == (409, {"detail": "seat_taken"})
@@ -74,17 +48,17 @@ def test_claim_without_a_user_is_rejected(client, seat_id):
 
 # --- POST /seats/{id}/pay ---
 
-def test_claim_and_pay_sells_the_seat(client, event_id, seat_id):
-    client.post(f"/seats/{seat_id}/claim", headers=as_user("alice"))
+def test_claim_and_pay_sells_the_seat(client, event_id, seat_id, admitted):
+    client.post(f"/seats/{seat_id}/claim", headers=admitted("alice"))
     r = client.post(f"/seats/{seat_id}/pay", headers=as_user("alice", "k1"))
 
     assert r.json() == {"outcome": "sold", "attempts_left": None, "seconds_left": None}
     assert seat_status(client, event_id) == "sold"
 
 
-def test_retry_after_decline_uses_the_same_endpoint(client, bank, seat_id):
+def test_retry_after_decline_uses_the_same_endpoint(client, bank, seat_id, admitted):
     bank.replies = ["decline", "approve"]
-    client.post(f"/seats/{seat_id}/claim", headers=as_user("alice"))
+    client.post(f"/seats/{seat_id}/claim", headers=admitted("alice"))
 
     first = client.post(f"/seats/{seat_id}/pay", headers=as_user("alice", "k1"))
     retry = client.post(f"/seats/{seat_id}/pay", headers=as_user("alice", "k2"))
@@ -94,9 +68,9 @@ def test_retry_after_decline_uses_the_same_endpoint(client, bank, seat_id):
     assert retry.json()["outcome"] == "sold"
 
 
-def test_paying_restarts_the_countdown(client, conn, bank, seat_id):
+def test_paying_restarts_the_countdown(client, conn, bank, seat_id, admitted):
     bank.replies = ["decline"]
-    client.post(f"/seats/{seat_id}/claim", headers=as_user("alice"))
+    client.post(f"/seats/{seat_id}/claim", headers=admitted("alice"))
     # Alice used up 4 of her 5 hold minutes before pressing Pay.
     conn.execute("UPDATE seats SET hold_expires_at = now() + interval '1 minute' WHERE id = %s", (seat_id,))
     conn.commit()
@@ -107,8 +81,8 @@ def test_paying_restarts_the_countdown(client, conn, bank, seat_id):
     assert 295 <= r.json()["seconds_left"] <= 300  # a fresh 5-minute payment window
 
 
-def test_double_click_asks_the_bank_once(client, bank, seat_id):
-    client.post(f"/seats/{seat_id}/claim", headers=as_user("alice"))
+def test_double_click_asks_the_bank_once(client, bank, seat_id, admitted):
+    client.post(f"/seats/{seat_id}/claim", headers=admitted("alice"))
     client.post(f"/seats/{seat_id}/pay", headers=as_user("alice", "k1"))
     again = client.post(f"/seats/{seat_id}/pay", headers=as_user("alice", "k1"))
 
@@ -116,16 +90,16 @@ def test_double_click_asks_the_bank_once(client, bank, seat_id):
     assert len(bank.authorized) == 1
 
 
-def test_price_comes_from_the_server_not_the_request(client, conn, seat_id):
-    client.post(f"/seats/{seat_id}/claim", headers=as_user("alice"))
+def test_price_comes_from_the_server_not_the_request(client, conn, seat_id, admitted):
+    client.post(f"/seats/{seat_id}/claim", headers=admitted("alice"))
     # A bot tries to set its own price.
     client.post(f"/seats/{seat_id}/pay", headers=as_user("alice", "k1"), json={"amount_cents": 1})
 
     assert conn.execute("SELECT amount_cents FROM payments").fetchone()[0] == 4999
 
 
-def test_pay_without_idempotency_key_is_rejected(client, bank, seat_id):
-    client.post(f"/seats/{seat_id}/claim", headers=as_user("alice"))
+def test_pay_without_idempotency_key_is_rejected(client, bank, seat_id, admitted):
+    client.post(f"/seats/{seat_id}/claim", headers=admitted("alice"))
     assert client.post(f"/seats/{seat_id}/pay", headers=as_user("alice")).status_code == 422
     assert bank.authorized == []
 

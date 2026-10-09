@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     hold_seconds: int = 300
     payment_seconds: int = 300
     max_payment_attempts: int = 3
+    queue_secret: str
+    room_size: int = 100
+    queue_token_seconds: int = 300
 
 
 settings = Settings()

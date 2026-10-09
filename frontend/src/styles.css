@@ -39,3 +39,5 @@ header { display: flex; justify-content: space-between; align-items: baseline; }
 button { font: inherit; padding: 8px 16px; border-radius: 8px; border: 1px solid var(--taken); background: white; cursor: pointer; }
 button.pay { background: var(--accent); color: white; border: 0; width: 100%; padding: 12px; }
 button:disabled { opacity: 0.6; cursor: default; }
+.pass { color: var(--muted); }
+.pass.warn { color: var(--warn); font-weight: 700; }

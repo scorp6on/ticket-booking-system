@@ -44,13 +44,32 @@ export async function getEvent(eventId: number): Promise<Event> {
   return r.json();
 }
 
-/** Returns seconds left on the hold, or null if someone else got the seat first. */
-export async function claimSeat(seatId: number): Promise<number | null> {
-  const r = await fetch(`/api/seats/${seatId}/claim`, {
+export type QueueStatus =
+  | { state: "waiting"; position: number; sale_open: boolean }
+  | { state: "admitted"; token: string; seconds_left: number; sale_open: boolean }
+  | { state: "sold_out" | "not_in_line"; sale_open: boolean };
+
+/** Joins the line if needed and reports where we stand. Polled every few seconds. */
+export async function queueStatus(eventId: number): Promise<QueueStatus> {
+  const r = await fetch(`/api/events/${eventId}/queue`, {
     method: "POST",
     headers: { "X-User-Id": userId },
   });
+  if (!r.ok) throw new Error(`event ${eventId} not found`);
+  return r.json();
+}
+
+export class QueueTokenExpired extends Error {}
+
+/** Returns seconds left on the hold, or null if someone else got the seat first.
+ * Throws QueueTokenExpired if our time to pick a seat ran out. */
+export async function claimSeat(seatId: number, queueToken: string): Promise<number | null> {
+  const r = await fetch(`/api/seats/${seatId}/claim`, {
+    method: "POST",
+    headers: { "X-User-Id": userId, "X-Queue-Token": queueToken },
+  });
   if (r.status === 409) return null;
+  if (r.status === 403) throw new QueueTokenExpired();
   if (!r.ok) throw new Error(`claim failed: ${r.status}`);
   return (await r.json()).seconds_left;
 }

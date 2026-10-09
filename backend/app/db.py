@@ -6,3 +6,7 @@ def get_conn(request: Request):
     # connections instead of connecting on every request.
     with request.app.state.pool.connection() as conn:
         yield conn
+
+
+def get_redis(request: Request):
+    return request.app.state.redis

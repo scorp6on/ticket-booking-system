@@ -1,20 +1,38 @@
 import { useCallback, useEffect, useState } from "react";
-import { claimSeat, getEvent, pay, userId, type Event, type Seat } from "./api";
+import {
+  claimSeat,
+  getEvent,
+  pay,
+  queueStatus,
+  QueueTokenExpired,
+  userId,
+  type Event,
+  type QueueStatus,
+  type Seat,
+} from "./api";
 
 const eventId = Number(new URLSearchParams(location.search).get("event") ?? 1);
 const REFRESH_MS = 5000;
+const QUEUE_POLL_MS = 3000;
 const WARN_AT_SECONDS = 60;
 const TIME_UP = "Your time is up, so the seat went back on sale. You haven't been charged.";
+const PASS_EXPIRED = "Your time to pick a seat ran out, so you've rejoined the line.";
+
+/** Proof we waited our turn, plus how long it lasts. */
+type Pass = { token: string; secondsLeft: number; startedAt: number };
 
 type View =
-  | { kind: "lobby"; note?: string }
-  | { kind: "checkout"; seat: Seat; secondsLeft: number; startedAt: number; message?: string }
+  | { kind: "queue"; note?: string }
+  | { kind: "lobby"; pass: Pass; note?: string }
+  | { kind: "checkout"; pass: Pass; seat: Seat; secondsLeft: number; startedAt: number; message?: string }
   | { kind: "sold"; seat: Seat };
 
 const money = (cents: number) => `$${(cents / 100).toFixed(2)}`;
+const clock = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 
 export default function App() {
-  const [view, setView] = useState<View>({ kind: "lobby" });
+  const [view, setView] = useState<View>({ kind: "queue" });
+  const onAdmitted = useCallback((pass: Pass) => setView({ kind: "lobby", pass }), []);
 
   return (
     <main>
@@ -22,29 +40,82 @@ export default function App() {
         <h1>Ticket Booking</h1>
         <span className="who">You are {userId}</span>
       </header>
-      {view.kind === "lobby" && <Lobby note={view.note} onHeld={(seat, secondsLeft) =>
-        setView({ kind: "checkout", seat, secondsLeft, startedAt: performance.now() })} onNote={(note) =>
-        setView({ kind: "lobby", note })} />}
+      {view.kind === "queue" && <Queue note={view.note} onAdmitted={onAdmitted} />}
+      {view.kind === "lobby" && <Lobby view={view} setView={setView} />}
       {view.kind === "checkout" && <Checkout view={view} setView={setView} />}
       {view.kind === "sold" && (
         <section className="card">
           <h2>🎉 Seat {view.seat.label} is yours</h2>
           <p>{money(view.seat.price_cents)} charged.</p>
-          <button onClick={() => setView({ kind: "lobby" })}>Back to seats</button>
+          <button onClick={() => setView({ kind: "queue" })}>Buy another seat</button>
         </section>
       )}
     </main>
   );
 }
 
-function Lobby({ note, onHeld, onNote }: {
-  note?: string;
-  onHeld: (seat: Seat, secondsLeft: number) => void;
-  onNote: (note: string) => void;
+function Queue({ note, onAdmitted }: { note?: string; onAdmitted: (pass: Pass) => void }) {
+  const [status, setStatus] = useState<QueueStatus | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // Each poll also keeps our place: the server joins us to the line if we're not in it.
+  useEffect(() => {
+    let done = false;
+    const poll = () =>
+      queueStatus(eventId).then(
+        (s) => {
+          if (done) return;
+          if (s.state === "admitted") {
+            done = true;
+            onAdmitted({ token: s.token, secondsLeft: s.seconds_left, startedAt: performance.now() });
+          } else {
+            setStatus(s);
+          }
+        },
+        (e) => setError(String(e.message)),
+      );
+    poll();
+    const timer = setInterval(poll, QUEUE_POLL_MS);
+    return () => {
+      done = true;
+      clearInterval(timer);
+    };
+  }, [onAdmitted]);
+
+  if (error) return <p className="note error">{error}. Did you run the seed script?</p>;
+  return (
+    <section className="card">
+      {note && <p className="note">{note}</p>}
+      {status?.state === "sold_out" ? (
+        <h2>Sold out</h2>
+      ) : status?.state === "waiting" && !status.sale_open ? (
+        <>
+          <h2>You're in the waiting room</h2>
+          <p>
+            When the sale opens, everyone here gets a random place in line, so there's no need to rush or
+            refresh.
+          </p>
+        </>
+      ) : status?.state === "waiting" ? (
+        <>
+          <h2>You're number {status.position} in line</h2>
+          <p>Keep this page open. You'll go straight to the seat map when it's your turn.</p>
+        </>
+      ) : (
+        <p>Joining the line…</p>
+      )}
+    </section>
+  );
+}
+
+function Lobby({ view, setView }: {
+  view: Extract<View, { kind: "lobby" }>;
+  setView: (v: View) => void;
 }) {
   const [event, setEvent] = useState<Event | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [claiming, setClaiming] = useState(false);
+  const passLeft = useCountdown(view.pass.secondsLeft, view.pass.startedAt);
 
   const load = useCallback(() => {
     getEvent(eventId).then(setEvent, (e) => setError(String(e.message)));
@@ -57,16 +128,23 @@ function Lobby({ note, onHeld, onNote }: {
     return () => clearInterval(timer);
   }, [load]);
 
+  useEffect(() => {
+    if (passLeft <= 0) setView({ kind: "queue", note: PASS_EXPIRED });
+  }, [passLeft, setView]);
+
   async function choose(seat: Seat) {
     setClaiming(true);
     try {
-      const secondsLeft = await claimSeat(seat.id);
+      const secondsLeft = await claimSeat(seat.id, view.pass.token);
       if (secondsLeft === null) {
-        onNote(`Seat ${seat.label} was just taken by someone else. Please pick another seat.`);
+        setView({ ...view, note: `Seat ${seat.label} was just taken by someone else. Please pick another seat.` });
         load();
       } else {
-        onHeld(seat, secondsLeft);
+        setView({ kind: "checkout", pass: view.pass, seat, secondsLeft, startedAt: performance.now() });
       }
+    } catch (e) {
+      if (e instanceof QueueTokenExpired) return setView({ kind: "queue", note: PASS_EXPIRED });
+      throw e;
     } finally {
       setClaiming(false);
     }
@@ -80,7 +158,8 @@ function Lobby({ note, onHeld, onNote }: {
   return (
     <section>
       <h2>{event.name}</h2>
-      {note && <p className="note">{note}</p>}
+      <p className={`pass ${passLeft <= WARN_AT_SECONDS ? "warn" : ""}`}>Time to pick a seat: {clock(passLeft)}</p>
+      {view.note && <p className="note">{view.note}</p>}
       <div className="stage">STAGE</div>
       <div className="seat-map">
         {[...rows].map(([row, seats]) => (
@@ -111,10 +190,11 @@ function Checkout({ view, setView }: {
 }) {
   const [paying, setPaying] = useState(false);
   const remaining = useCountdown(view.secondsLeft, view.startedAt);
+  const backToSeats = (note: string) => setView({ kind: "lobby", pass: view.pass, note });
 
   useEffect(() => {
-    if (remaining <= 0) setView({ kind: "lobby", note: TIME_UP });
-  }, [remaining, setView]);
+    if (remaining <= 0) backToSeats(TIME_UP);
+  }, [remaining]);
 
   async function onPay() {
     setPaying(true);
@@ -133,10 +213,10 @@ function Checkout({ view, setView }: {
         case "in_progress":
           return stay("Your bank hasn't answered yet. If it doesn't answer in time, you won't be charged.");
         case "seat_released":
-          return setView({ kind: "lobby", note: "Your card was declined 3 times, so the seat went back on sale." });
+          return backToSeats("Your card was declined 3 times, so the seat went back on sale.");
         case "expired":
         case "not_holder":
-          return setView({ kind: "lobby", note: TIME_UP });
+          return backToSeats(TIME_UP);
       }
     } finally {
       setPaying(false);
@@ -146,9 +226,7 @@ function Checkout({ view, setView }: {
   const warn = remaining <= WARN_AT_SECONDS;
   return (
     <section className="card">
-      <div className={`countdown ${warn ? "warn" : ""}`}>
-        ⏱ {Math.floor(remaining / 60)}:{String(remaining % 60).padStart(2, "0")}
-      </div>
+      <div className={`countdown ${warn ? "warn" : ""}`}>⏱ {clock(remaining)}</div>
       {warn && <p className="note warn">Less than a minute left to finish paying!</p>}
       <h2>Seat {view.seat.label}</h2>
       <p>{money(view.seat.price_cents)}</p>

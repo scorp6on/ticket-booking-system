@@ -152,3 +152,9 @@ def seconds_left(conn: psycopg.Connection, seat_id: int, user_id: str) -> int | 
     ).fetchone()
     conn.commit()
     return None if row is None else row[0]
+
+
+def seat_event_id(conn: psycopg.Connection, seat_id: int) -> int | None:
+    row = conn.execute("SELECT event_id FROM seats WHERE id = %s", (seat_id,)).fetchone()
+    conn.commit()
+    return None if row is None else row[0]

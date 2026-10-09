@@ -14,7 +14,8 @@ def main() -> None:
     with psycopg.connect(settings.database_url) as conn:
         conn.execute(SCHEMA)
         event_id = conn.execute(
-            "INSERT INTO events (name, starts_at) VALUES ('Demo Concert', now() + interval '7 days') RETURNING id"
+            "INSERT INTO events (name, starts_at, sale_opens_at) "
+            "VALUES ('Demo Concert', now() + interval '7 days', now() + interval '1 minute') RETURNING id"
         ).fetchone()[0]
         for i, row in enumerate(ROWS):
             price = 7999 if i < 2 else 4999  # front rows cost more
@@ -24,7 +25,7 @@ def main() -> None:
                     (event_id, f"{row}{n}", price),
                 )
         conn.commit()
-    print(f"Created event {event_id}: open http://localhost:5173/?event={event_id}")
+    print(f"Created event {event_id}, sale opens in 1 minute: http://localhost:5173/?event={event_id}")
 
 
 if __name__ == "__main__":
