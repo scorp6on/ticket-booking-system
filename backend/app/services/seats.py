@@ -158,3 +158,40 @@ def seat_event_id(conn: psycopg.Connection, seat_id: int) -> int | None:
     row = conn.execute("SELECT event_id FROM seats WHERE id = %s", (seat_id,)).fetchone()
     conn.commit()
     return None if row is None else row[0]
+
+
+TICKET_LIMIT = 3
+
+# Seats this buyer has in the same event: sold, or held/paying with time left.
+# Expired holds don't count, matching CLAIM_SQL's idea of "taken".
+COUNT_BUYER_SEATS_SQL = """
+SELECT count(*) FROM seats
+WHERE held_by = %(user_id)s
+  AND event_id = (SELECT event_id FROM seats WHERE id = %(seat_id)s)
+  AND (status = 'sold' OR (status IN ('held', 'payment_pending') AND hold_expires_at > now()))
+"""
+
+
+def claim_seat_within_limit(
+    conn: psycopg.Connection,
+    seat_id: int,
+    account_id: int,
+    limit: int = TICKET_LIMIT,
+    hold_seconds: int = settings.hold_seconds,
+) -> str:
+    """Claim a seat unless this account already has `limit` seats for the event.
+    Returns 'held', 'taken', or 'limit_reached'.
+
+    Lock, count, claim: the lock on the account's row makes one buyer's requests take
+    turns, so 4 tabs clicking at once can't all count "2" and all win."""
+    user_id = str(account_id)
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM users WHERE id = %s FOR UPDATE", (account_id,))
+        cur.execute(COUNT_BUYER_SEATS_SQL, {"user_id": user_id, "seat_id": seat_id})
+        if cur.fetchone()[0] >= limit:
+            conn.rollback()  # releases the lock
+            return "limit_reached"
+        cur.execute(CLAIM_SQL, {"seat_id": seat_id, "user_id": user_id, "hold_seconds": hold_seconds})
+        won = cur.rowcount == 1
+    conn.commit()  # releases the lock; the next tab now counts this seat
+    return "held" if won else "taken"

@@ -12,6 +12,8 @@ export type Event = {
   seats: Seat[];
 };
 
+export type Account = { email: string; id_verified: boolean };
+
 export type PayOutcome =
   | "sold"
   | "declined"
@@ -27,60 +29,52 @@ export type PayResult = {
   seconds_left: number | null;
 };
 
-// Stand-in for a login: each browser tab is a different buyer, so two tabs
-// can race for the same seat. Replaced by real accounts in the anti-bot milestone.
-export const userId = (() => {
-  let id = sessionStorage.getItem("userId");
-  if (!id) {
-    id = `buyer-${Math.random().toString(36).slice(2, 6)}`;
-    sessionStorage.setItem("userId", id);
-  }
-  return id;
-})();
-
-export async function getEvent(eventId: number): Promise<Event> {
-  const r = await fetch(`/api/events/${eventId}`);
-  if (!r.ok) throw new Error(`event ${eventId} not found`);
-  return r.json();
-}
-
 export type QueueStatus =
   | { state: "waiting"; position: number; sale_open: boolean }
   | { state: "admitted"; token: string; seconds_left: number; sale_open: boolean }
   | { state: "sold_out" | "not_in_line"; sale_open: boolean };
 
-/** Joins the line if needed and reports where we stand. Polled every few seconds. */
-export async function queueStatus(eventId: number): Promise<QueueStatus> {
-  const r = await fetch(`/api/events/${eventId}/queue`, {
-    method: "POST",
-    headers: { "X-User-Id": userId },
-  });
-  if (!r.ok) throw new Error(`event ${eventId} not found`);
-  return r.json();
+export type Captcha = { captcha_id: string; question: string };
+
+/** An error the server explained, e.g. "seat_taken" or "captcha_required". */
+export class ApiError extends Error {
+  constructor(public status: number, public detail: string) {
+    super(detail);
+  }
 }
 
-export class QueueTokenExpired extends Error {}
-
-/** Returns seconds left on the hold, or null if someone else got the seat first.
- * Throws QueueTokenExpired if our time to pick a seat ran out. */
-export async function claimSeat(seatId: number, queueToken: string): Promise<number | null> {
-  const r = await fetch(`/api/seats/${seatId}/claim`, {
-    method: "POST",
-    headers: { "X-User-Id": userId, "X-Queue-Token": queueToken },
+// The session cookie is HttpOnly: this code never sees it. The browser attaches it
+// to every request automatically, so nothing here sends a user id.
+async function call<T>(method: string, path: string, body?: unknown, headers: Record<string, string> = {}): Promise<T> {
+  const r = await fetch(`/api${path}`, {
+    method,
+    headers: body === undefined ? headers : { ...headers, "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
   });
-  if (r.status === 409) return null;
-  if (r.status === 403) throw new QueueTokenExpired();
-  if (!r.ok) throw new Error(`claim failed: ${r.status}`);
-  return (await r.json()).seconds_left;
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new ApiError(r.status, typeof data.detail === "string" ? data.detail : `error_${r.status}`);
+  return data as T;
 }
+
+export const signUp = (email: string, password: string) => call("POST", "/accounts", { email, password });
+export const logIn = (email: string, password: string) => call("POST", "/sessions", { email, password });
+export const logOut = () => call("DELETE", "/sessions");
+export const me = () => call<Account>("GET", "/me");
+export const verifyId = (id_number: string) => call("POST", "/me/verify-id", { id_number });
+export const getCaptcha = () => call<Captcha>("GET", "/captcha");
+export const getEvent = (eventId: number) => call<Event>("GET", `/events/${eventId}`);
+
+/** Joins the line (needs a solved CAPTCHA the first time) and reports where we stand. */
+export const queueStatus = (eventId: number, captcha?: { captcha_id: string; answer: string }) =>
+  call<QueueStatus>("POST", `/events/${eventId}/queue`, captcha);
+
+/** Returns seconds left on the hold. Throws ApiError "seat_taken", "ticket_limit_reached",
+ * or "queue_token_invalid" (our time to pick a seat ran out). */
+export const claimSeat = async (seatId: number, queueToken: string) =>
+  (await call<{ seconds_left: number }>("POST", `/seats/${seatId}/claim`, undefined, { "X-Queue-Token": queueToken }))
+    .seconds_left;
 
 /** One call per press of Pay. A new key each press: a retry after a decline is a new request.
  * No amount is sent: the server decides the price. */
-export async function pay(seatId: number): Promise<PayResult> {
-  const r = await fetch(`/api/seats/${seatId}/pay`, {
-    method: "POST",
-    headers: { "X-User-Id": userId, "Idempotency-Key": crypto.randomUUID() },
-  });
-  if (!r.ok) throw new Error(`pay failed: ${r.status}`);
-  return r.json();
-}
+export const pay = (seatId: number) =>
+  call<PayResult>("POST", `/seats/${seatId}/pay`, undefined, { "Idempotency-Key": crypto.randomUUID() });

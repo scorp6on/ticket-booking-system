@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from app.api.routes import get_bank
 from app.config import settings
 from app.main import app
-from app.services import queue
+from app.services import accounts, queue
 from app.services.bank import MockBank
 
 SCHEMA = (Path(__file__).parent.parent / "app" / "schema.sql").read_text()
@@ -18,7 +18,7 @@ SCHEMA = (Path(__file__).parent.parent / "app" / "schema.sql").read_text()
 def conn():
     with psycopg.connect(settings.database_url) as c:
         # Rebuild from scratch so schema changes always apply (wipes local data).
-        c.execute("DROP TABLE IF EXISTS payments, seats, events")
+        c.execute("DROP TABLE IF EXISTS payments, seats, events, sessions, users")
         c.execute(SCHEMA)
         c.commit()
         yield c
@@ -65,9 +65,37 @@ def client(conn, r, bank):  # conn and r first: they wipe Postgres and Redis
 
 
 @pytest.fixture
-def admitted(event_id, r):
-    """Headers for a user who waited their turn and holds a valid queue token."""
-    def headers(user_id):
+def buyer(conn):
+    """Verified, logged-in accounts by name: buyer("alice") -> (account_id, headers with her session cookie)."""
+    made = {}
+
+    def get(name):
+        if name not in made:
+            email = f"{name}@example.com"
+            account_id = accounts.sign_up(conn, email, "correct-horse")
+            accounts.verify_id(conn, account_id, f"ID-{name}")
+            made[name] = (account_id, {"Cookie": f"session={accounts.log_in(conn, email, 'correct-horse')}"})
+        return made[name]
+
+    return get
+
+
+@pytest.fixture
+def admitted(event_id, r, buyer):
+    """Headers for a buyer who waited their turn and holds a valid queue token."""
+    def headers(name):
+        account_id, cookie = buyer(name)
         expires_ms = (r.time()[0] + 300) * 1000
-        return {"X-User-Id": user_id, "X-Queue-Token": queue.issue_token(event_id, user_id, expires_ms)}
+        return {**cookie, "X-Queue-Token": queue.issue_token(event_id, str(account_id), expires_ms)}
+    return headers
+
+
+@pytest.fixture
+def paying(buyer):
+    """Headers for a buyer pressing Pay: their session cookie plus an idempotency key."""
+    def headers(name, key=None):
+        h = dict(buyer(name)[1])
+        if key:
+            h["Idempotency-Key"] = key
+        return h
     return headers

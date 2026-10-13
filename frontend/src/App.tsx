@@ -1,11 +1,18 @@
 import { useCallback, useEffect, useState } from "react";
 import {
+  ApiError,
   claimSeat,
+  getCaptcha,
   getEvent,
+  logIn,
+  logOut,
+  me,
   pay,
   queueStatus,
-  QueueTokenExpired,
-  userId,
+  signUp,
+  verifyId,
+  type Account,
+  type Captcha,
   type Event,
   type QueueStatus,
   type Seat,
@@ -31,15 +38,120 @@ const money = (cents: number) => `$${(cents / 100).toFixed(2)}`;
 const clock = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 
 export default function App() {
+  // undefined = still checking the session cookie, null = logged out
+  const [account, setAccount] = useState<Account | null | undefined>(undefined);
   const [view, setView] = useState<View>({ kind: "queue" });
   const onAdmitted = useCallback((pass: Pass) => setView({ kind: "lobby", pass }), []);
+
+  const refreshAccount = useCallback(() => {
+    me().then(setAccount, () => setAccount(null));
+  }, []);
+  useEffect(refreshAccount, [refreshAccount]);
+
+  async function onLogOut() {
+    await logOut();
+    setAccount(null);
+    setView({ kind: "queue" });
+  }
 
   return (
     <main>
       <header>
         <h1>Ticket Booking</h1>
-        <span className="who">You are {userId}</span>
+        {account && (
+          <span className="who">
+            {account.email} <button className="link" onClick={onLogOut}>Log out</button>
+          </span>
+        )}
       </header>
+      {account === undefined && <p>Loading…</p>}
+      {account === null && <Auth onLoggedIn={refreshAccount} />}
+      {account && !account.id_verified && <VerifyId onVerified={refreshAccount} />}
+      {account?.id_verified && <Buying view={view} setView={setView} onAdmitted={onAdmitted} />}
+    </main>
+  );
+}
+
+function Auth({ onLoggedIn }: { onLoggedIn: () => void }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function submit(mode: "log_in" | "sign_up") {
+    setBusy(true);
+    setError(null);
+    try {
+      if (mode === "sign_up") await signUp(email, password);
+      await logIn(email, password);
+      onLoggedIn();
+    } catch (e) {
+      const detail = e instanceof ApiError ? e.detail : "";
+      setError(
+        detail === "email_taken" ? "That email already has an account. Log in instead."
+        : detail === "wrong_email_or_password" ? "Wrong email or password."
+        : e instanceof ApiError && e.status === 422 ? "Use a valid email and a password of at least 8 characters."
+        : "Something went wrong. Please try again.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="card form">
+      <h2>Log in or create an account</h2>
+      <label>Email <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} /></label>
+      <label>Password <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
+      {error && <p className="note error">{error}</p>}
+      <div className="actions">
+        <button className="pay" disabled={busy} onClick={() => submit("log_in")}>Log in</button>
+        <button disabled={busy} onClick={() => submit("sign_up")}>Create account</button>
+      </div>
+    </section>
+  );
+}
+
+function VerifyId({ onVerified }: { onVerified: () => void }) {
+  const [idNumber, setIdNumber] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit() {
+    setError(null);
+    try {
+      await verifyId(idNumber);
+      onVerified();
+    } catch (e) {
+      setError(
+        e instanceof ApiError && e.detail === "id_already_used"
+          ? "That ID already verified another account. Each person can have one account."
+          : "Enter an ID number of at least 4 characters.",
+      );
+    }
+  }
+
+  return (
+    <section className="card form">
+      <h2>Verify your ID</h2>
+      <p>
+        Only verified buyers can join the line, so bots can't fill it with fake accounts. Verify now,
+        before the sale starts.
+      </p>
+      <p className="demo">Demo: any ID number works, but each one can verify only one account.</p>
+      <label>ID number <input value={idNumber} onChange={(e) => setIdNumber(e.target.value)} /></label>
+      {error && <p className="note error">{error}</p>}
+      <button className="pay" onClick={submit}>Verify my ID</button>
+    </section>
+  );
+}
+
+function Buying({ view, setView, onAdmitted }: {
+  view: View;
+  setView: (v: View) => void;
+  onAdmitted: (pass: Pass) => void;
+}) {
+  return (
+    <>
       {view.kind === "queue" && <Queue note={view.note} onAdmitted={onAdmitted} />}
       {view.kind === "lobby" && <Lobby view={view} setView={setView} />}
       {view.kind === "checkout" && <Checkout view={view} setView={setView} />}
@@ -50,43 +162,102 @@ export default function App() {
           <button onClick={() => setView({ kind: "queue" })}>Buy another seat</button>
         </section>
       )}
-    </main>
+    </>
   );
 }
 
 function Queue({ note, onAdmitted }: { note?: string; onAdmitted: (pass: Pass) => void }) {
   const [status, setStatus] = useState<QueueStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [captcha, setCaptcha] = useState<Captcha | null>(null);
+  const [answer, setAnswer] = useState("");
+  const [wrongAnswer, setWrongAnswer] = useState(false);
+  const [inLine, setInLine] = useState(false);
 
-  // Each poll also keeps our place: the server joins us to the line if we're not in it.
+  const handle = useCallback(
+    (s: QueueStatus) => {
+      if (s.state === "admitted") {
+        onAdmitted({ token: s.token, secondsLeft: s.seconds_left, startedAt: performance.now() });
+      } else {
+        setStatus(s);
+      }
+    },
+    [onAdmitted],
+  );
+
+  const askForCaptcha = useCallback(() => {
+    setInLine(false);
+    setAnswer("");
+    getCaptcha().then(setCaptcha, (e) => setError(String(e.message)));
+  }, []);
+
+  const onError = useCallback(
+    (e: unknown) => {
+      if (e instanceof ApiError && e.detail === "captcha_required") askForCaptcha();
+      else setError(e instanceof Error ? e.message : String(e));
+    },
+    [askForCaptcha],
+  );
+
+  // First check without a CAPTCHA: if we're already in line (say, after a refresh), we keep our spot.
   useEffect(() => {
+    queueStatus(eventId).then((s) => {
+      setInLine(true);
+      handle(s);
+    }, onError);
+  }, [handle, onError]);
+
+  // Once in line, keep checking. Each check also lets people in as spots free up.
+  useEffect(() => {
+    if (!inLine) return;
     let done = false;
-    const poll = () =>
-      queueStatus(eventId).then(
-        (s) => {
+    const timer = setInterval(
+      () =>
+        queueStatus(eventId).then((s) => {
           if (done) return;
-          if (s.state === "admitted") {
-            done = true;
-            onAdmitted({ token: s.token, secondsLeft: s.seconds_left, startedAt: performance.now() });
-          } else {
-            setStatus(s);
-          }
-        },
-        (e) => setError(String(e.message)),
-      );
-    poll();
-    const timer = setInterval(poll, QUEUE_POLL_MS);
+          if (s.state === "admitted") done = true;
+          handle(s);
+        }, onError),
+      QUEUE_POLL_MS,
+    );
     return () => {
       done = true;
       clearInterval(timer);
     };
-  }, [onAdmitted]);
+  }, [inLine, handle, onError]);
+
+  async function submitCaptcha() {
+    if (!captcha) return;
+    try {
+      const s = await queueStatus(eventId, { captcha_id: captcha.captcha_id, answer });
+      setCaptcha(null);
+      setWrongAnswer(false);
+      setInLine(true);
+      handle(s);
+    } catch (e) {
+      if (e instanceof ApiError && e.detail === "captcha_required") {
+        setWrongAnswer(true);
+        askForCaptcha(); // each puzzle works once, so a wrong answer gets a new one
+      } else {
+        onError(e);
+      }
+    }
+  }
 
   if (error) return <p className="note error">{error}. Did you run the seed script?</p>;
   return (
     <section className="card">
       {note && <p className="note">{note}</p>}
-      {status?.state === "sold_out" ? (
+      {captcha ? (
+        <div className="form">
+          <h2>Before you join the line</h2>
+          <p>Prove you're human: <strong>{captcha.question}</strong></p>
+          <p className="demo">Demo CAPTCHA. A real site would use a service like Cloudflare Turnstile.</p>
+          {wrongAnswer && <p className="note error">That wasn't right. Here's a new one.</p>}
+          <label>Answer <input value={answer} onChange={(e) => setAnswer(e.target.value)} /></label>
+          <button className="pay" onClick={submitCaptcha}>Join the line</button>
+        </div>
+      ) : status?.state === "sold_out" ? (
         <h2>Sold out</h2>
       ) : status?.state === "waiting" && !status.sale_open ? (
         <>
@@ -102,7 +273,7 @@ function Queue({ note, onAdmitted }: { note?: string; onAdmitted: (pass: Pass) =
           <p>Keep this page open. You'll go straight to the seat map when it's your turn.</p>
         </>
       ) : (
-        <p>Joining the line…</p>
+        <p>Checking the line…</p>
       )}
     </section>
   );
@@ -136,14 +307,16 @@ function Lobby({ view, setView }: {
     setClaiming(true);
     try {
       const secondsLeft = await claimSeat(seat.id, view.pass.token);
-      if (secondsLeft === null) {
-        setView({ ...view, note: `Seat ${seat.label} was just taken by someone else. Please pick another seat.` });
-        load();
-      } else {
-        setView({ kind: "checkout", pass: view.pass, seat, secondsLeft, startedAt: performance.now() });
-      }
+      setView({ kind: "checkout", pass: view.pass, seat, secondsLeft, startedAt: performance.now() });
     } catch (e) {
-      if (e instanceof QueueTokenExpired) return setView({ kind: "queue", note: PASS_EXPIRED });
+      const detail = e instanceof ApiError ? e.detail : "";
+      if (detail === "queue_token_invalid") return setView({ kind: "queue", note: PASS_EXPIRED });
+      if (detail === "ticket_limit_reached")
+        return setView({ ...view, note: "You already have 3 seats for this event (held or bought). That's the limit per person." });
+      if (detail === "seat_taken") {
+        setView({ ...view, note: `Seat ${seat.label} was just taken by someone else. Please pick another seat.` });
+        return load();
+      }
       throw e;
     } finally {
       setClaiming(false);

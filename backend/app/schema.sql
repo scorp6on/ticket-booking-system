@@ -1,3 +1,19 @@
+CREATE TABLE IF NOT EXISTS users (
+    id               BIGSERIAL PRIMARY KEY,
+    email            TEXT NOT NULL UNIQUE,
+    password_hash    TEXT NOT NULL,               -- Argon2: salted and deliberately slow; never the password itself
+    id_document_hash TEXT UNIQUE,                 -- hash of the verified ID number; UNIQUE = one account per real person
+    id_verified_at   TIMESTAMPTZ,                 -- NULL until the ID check passes
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- One row per login. Deleting the row logs that device out immediately.
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash  TEXT PRIMARY KEY,                 -- SHA-256 of the cookie's token, so a stolen table can't log anyone in
+    user_id     BIGINT NOT NULL REFERENCES users(id),
+    expires_at  TIMESTAMPTZ NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id         BIGSERIAL PRIMARY KEY,
     name       TEXT NOT NULL,

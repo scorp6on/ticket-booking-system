@@ -1,10 +1,11 @@
+import re
 import threading
 
 import pytest
 import redis
 
 from app.config import settings
-from app.services import queue
+from app.services import accounts, queue
 
 EVENT = 1
 
@@ -137,57 +138,104 @@ def test_made_up_token_is_rejected(r):
 
 # --- Through the API ---
 
-def join_line(client, event_id, user):
-    return client.post(f"/events/{event_id}/queue", headers={"X-User-Id": user}).json()
+def solved_captcha(client):
+    challenge = client.get("/captcha").json()
+    a, b = map(int, re.findall(r"\d+", challenge["question"]))
+    return {"captcha_id": challenge["captcha_id"], "answer": str(a + b)}
 
 
-def test_claim_without_a_token_is_rejected(client, seat_id):
-    r = client.post(f"/seats/{seat_id}/claim", headers={"X-User-Id": "bot-1"})
-    assert r.status_code == 422
+def join_line(client, event_id, headers):
+    return client.post(f"/events/{event_id}/queue", headers=headers, json=solved_captcha(client)).json()
 
 
-def test_claim_with_a_forged_token_is_rejected(client, seat_id, event_id):
-    headers = {"X-User-Id": "bot-1", "X-Queue-Token": f"{event_id}:99999999999999:bot-1:{'0' * 64}"}
-    r = client.post(f"/seats/{seat_id}/claim", headers=headers)
-    assert (r.status_code, r.json()) == (403, {"detail": "queue_token_invalid"})
+def test_claim_without_a_queue_token_is_rejected(client, seat_id, buyer):
+    resp = client.post(f"/seats/{seat_id}/claim", headers=buyer("bot")[1])
+    assert resp.status_code == 422
 
 
-def test_waiting_room_before_the_sale_opens(client, conn, event_id):
+def test_claim_with_a_forged_token_is_rejected(client, seat_id, event_id, buyer):
+    account_id, cookie = buyer("bot")
+    headers = {**cookie, "X-Queue-Token": f"{event_id}:99999999999999:{account_id}:{'0' * 64}"}
+    resp = client.post(f"/seats/{seat_id}/claim", headers=headers)
+    assert (resp.status_code, resp.json()) == (403, {"detail": "queue_token_invalid"})
+
+
+def test_joining_needs_a_login(client, event_id):
+    resp = client.post(f"/events/{event_id}/queue", json=solved_captcha(client))
+    assert (resp.status_code, resp.json()) == (401, {"detail": "not_logged_in"})
+
+
+def test_joining_needs_a_verified_id(client, conn, event_id):
+    accounts.sign_up(conn, "new@example.com", "correct-horse")
+    cookie = {"Cookie": f"session={accounts.log_in(conn, 'new@example.com', 'correct-horse')}"}
+    resp = client.post(f"/events/{event_id}/queue", headers=cookie, json=solved_captcha(client))
+    assert (resp.status_code, resp.json()) == (403, {"detail": "id_not_verified"})
+
+
+def test_joining_needs_a_solved_captcha(client, event_id, buyer):
+    cookie = buyer("alice")[1]
+    no_captcha = client.post(f"/events/{event_id}/queue", headers=cookie)
+    wrong = client.post(
+        f"/events/{event_id}/queue", headers=cookie, json={**solved_captcha(client), "answer": "-1"}
+    )
+    assert (no_captcha.status_code, no_captcha.json()) == (403, {"detail": "captcha_required"})
+    assert (wrong.status_code, wrong.json()) == (403, {"detail": "captcha_required"})
+
+
+def test_one_solved_captcha_lets_in_only_one_buyer(client, event_id, buyer):
+    proof = solved_captcha(client)
+    first = client.post(f"/events/{event_id}/queue", headers=buyer("alice")[1], json=proof)
+    second = client.post(f"/events/{event_id}/queue", headers=buyer("bot")[1], json=proof)
+    assert first.status_code == 200
+    assert (second.status_code, second.json()) == (403, {"detail": "captcha_required"})
+
+
+def test_checking_your_place_needs_no_new_captcha(client, event_id, buyer):
+    cookie = buyer("alice")[1]
+    join_line(client, event_id, cookie)
+    resp = client.post(f"/events/{event_id}/queue", headers=cookie)  # a later poll
+    assert resp.status_code == 200
+
+
+def test_waiting_room_before_the_sale_opens(client, conn, event_id, buyer):
     conn.execute("UPDATE events SET sale_opens_at = now() + interval '10 minutes'")
     conn.commit()
-    status = join_line(client, event_id, "alice")
+    status = join_line(client, event_id, buyer("alice")[1])
     assert status == {"state": "waiting", "position": 1, "sale_open": False}  # nobody let in early
 
 
-def test_queue_to_seat_end_to_end(client, event_id, seat_id):
-    status = join_line(client, event_id, "alice")
+def test_queue_to_seat_end_to_end(client, event_id, seat_id, buyer):
+    cookie = buyer("alice")[1]
+    status = join_line(client, event_id, cookie)
     assert status["state"] == "admitted"
     assert status["seconds_left"] == settings.queue_token_seconds
 
-    r = client.post(f"/seats/{seat_id}/claim", headers={"X-User-Id": "alice", "X-Queue-Token": status["token"]})
-    assert r.status_code == 200
+    resp = client.post(f"/seats/{seat_id}/claim", headers={**cookie, "X-Queue-Token": status["token"]})
+    assert resp.status_code == 200
 
 
-def test_line_is_told_when_sold_out(client, monkeypatch, event_id, seat_id):
+def test_line_is_told_when_sold_out(client, monkeypatch, event_id, seat_id, buyer):
     monkeypatch.setattr(settings, "room_size", 1)
-    alice = join_line(client, event_id, "alice")
-    assert join_line(client, event_id, "bob") == {"state": "waiting", "position": 1, "sale_open": True}
+    alice, bob = buyer("alice")[1], buyer("bob")[1]
+    token = join_line(client, event_id, alice)["token"]
+    assert join_line(client, event_id, bob) == {"state": "waiting", "position": 1, "sale_open": True}
 
-    client.post(f"/seats/{seat_id}/claim", headers={"X-User-Id": "alice", "X-Queue-Token": alice["token"]})
-    client.post(f"/seats/{seat_id}/pay", headers={"X-User-Id": "alice", "Idempotency-Key": "k1"})
+    client.post(f"/seats/{seat_id}/claim", headers={**alice, "X-Queue-Token": token})
+    client.post(f"/seats/{seat_id}/pay", headers={**alice, "Idempotency-Key": "k1"})
 
     # The only seat is sold, so Bob is told instead of waiting forever.
-    assert join_line(client, event_id, "bob") == {"state": "sold_out", "sale_open": True}
+    assert join_line(client, event_id, bob) == {"state": "sold_out", "sale_open": True}
 
 
-def test_purchase_frees_a_room_spot(client, conn, monkeypatch, event_id, seat_id):
+def test_purchase_frees_a_room_spot(client, conn, monkeypatch, event_id, seat_id, buyer):
     conn.execute("INSERT INTO seats (event_id, label, price_cents) VALUES (%s, '14C', 4999)", (event_id,))
     conn.commit()
     monkeypatch.setattr(settings, "room_size", 1)
-    alice = join_line(client, event_id, "alice")
-    join_line(client, event_id, "bob")
+    alice, bob = buyer("alice")[1], buyer("bob")[1]
+    token = join_line(client, event_id, alice)["token"]
+    join_line(client, event_id, bob)
 
-    client.post(f"/seats/{seat_id}/claim", headers={"X-User-Id": "alice", "X-Queue-Token": alice["token"]})
-    client.post(f"/seats/{seat_id}/pay", headers={"X-User-Id": "alice", "Idempotency-Key": "k1"})
+    client.post(f"/seats/{seat_id}/claim", headers={**alice, "X-Queue-Token": token})
+    client.post(f"/seats/{seat_id}/pay", headers={**alice, "Idempotency-Key": "k1"})
 
-    assert join_line(client, event_id, "bob")["state"] == "admitted"
+    assert client.post(f"/events/{event_id}/queue", headers=bob).json()["state"] == "admitted"
