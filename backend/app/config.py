@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     queue_secret: str
     room_size: int = 100
     queue_token_seconds: int = 300
+    heartbeat_seconds: int = 20
 
 
 settings = Settings()

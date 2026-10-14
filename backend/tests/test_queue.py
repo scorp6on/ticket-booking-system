@@ -81,6 +81,51 @@ def test_expired_token_frees_the_spot(r, small_room):
     assert queue.status(r, EVENT, "a") == {"state": "not_in_line"}
 
 
+# --- Leaving without saying so (closed tab) ---
+
+def went_quiet(r, user, seconds=21):
+    """Pretend this user's last check-in was `seconds` ago."""
+    r.zadd(f"seen:{EVENT}", {user: (r.time()[0] - seconds) * 1000})
+
+
+def test_quiet_person_in_line_loses_their_spot(r, small_room):
+    for u in ["a", "b", "c", "d", "e"]:
+        queue.join(r, EVENT, u, sale_open=True)
+    went_quiet(r, "a")
+    queue.admit(r, EVENT)
+    assert in_room(r) == {"b", "c", "d"}
+    assert queue.status(r, EVENT, "a") == {"state": "not_in_line"}
+
+
+def test_quiet_person_in_the_room_frees_the_spot(r, small_room):
+    for u in ["a", "b", "c", "d"]:
+        queue.join(r, EVENT, u, sale_open=True)
+    queue.admit(r, EVENT)
+    went_quiet(r, "a")
+    queue.admit(r, EVENT)
+    assert in_room(r) == {"b", "c", "d"}
+
+
+def test_19_seconds_of_quiet_is_fine(r, small_room):
+    queue.join(r, EVENT, "a", sale_open=True)
+    went_quiet(r, "a", seconds=19)
+    queue.admit(r, EVENT)
+    assert in_room(r) == {"a"}
+
+
+def test_checking_in_keeps_your_spot(r, small_room):
+    queue.join(r, EVENT, "a", sale_open=True)
+    went_quiet(r, "a")
+    queue.check_in(r, EVENT, "a")
+    queue.admit(r, EVENT)
+    assert in_room(r) == {"a"}
+
+
+def test_checking_in_does_not_put_you_in_line(r):
+    queue.check_in(r, EVENT, "stranger")
+    assert r.zscore(f"seen:{EVENT}", "stranger") is None
+
+
 def test_20_servers_admitting_at_once_never_overfill_the_room(r):
     for n in range(300):
         queue.join(r, EVENT, f"user-{n}", sale_open=True)
@@ -238,4 +283,23 @@ def test_purchase_frees_a_room_spot(client, conn, monkeypatch, event_id, seat_id
     client.post(f"/seats/{seat_id}/claim", headers={**alice, "X-Queue-Token": token})
     client.post(f"/seats/{seat_id}/pay", headers={**alice, "Idempotency-Key": "k1"})
 
+    assert client.post(f"/events/{event_id}/queue", headers=bob).json()["state"] == "admitted"
+
+
+def test_seat_map_refresh_keeps_a_buyer_in_the_room(client, monkeypatch, event_id, buyer):
+    monkeypatch.setattr(settings, "room_size", 1)
+    alice_id, alice = buyer("alice")
+    bob = buyer("bob")[1]
+    join_line(client, event_id, alice)  # admitted
+    join_line(client, event_id, bob)  # waiting
+    r = client.app.state.redis
+
+    def alice_went_quiet():
+        r.zadd(f"seen:{event_id}", {str(alice_id): (r.time()[0] - 21) * 1000})
+
+    alice_went_quiet()
+    client.get(f"/events/{event_id}", headers=alice)  # alice is picking seats
+    assert client.post(f"/events/{event_id}/queue", headers=bob).json()["state"] == "waiting"
+
+    alice_went_quiet()  # alice closed the tab
     assert client.post(f"/events/{event_id}/queue", headers=bob).json()["state"] == "admitted"

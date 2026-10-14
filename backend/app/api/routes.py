@@ -1,16 +1,19 @@
-import psycopg
 import redis
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Response
+from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, Field
 
 from app.config import settings
-from app.db import get_conn, get_redis
+from app.db import get_pool, get_redis
 from app.services import accounts, captcha, checkout, events, queue, seats
 from app.services.bank import MockBank
 
 router = APIRouter()
 
 bank = MockBank(replies=[])  # always approves; tests swap in a scripted bank
+
+# Every endpoint takes a database connection and gives it back inside its own body
+# (`with pool.connection()`), never across steps. See the note in main.py.
 
 
 def get_bank() -> MockBank:
@@ -28,27 +31,36 @@ class IdDocument(BaseModel):
     id_number: str = Field(min_length=4, max_length=64)
 
 
-def current_account(
+def optional_account(
     session: str | None = Cookie(default=None),
-    conn: psycopg.Connection = Depends(get_conn),
-) -> dict:
-    """The logged-in account, from the session cookie. Every buying action requires one."""
-    account = accounts.current_user(conn, session) if session else None
+    pool: ConnectionPool = Depends(get_pool),
+) -> dict | None:
+    """The logged-in account from the session cookie, or None."""
+    if not session:
+        return None
+    with pool.connection() as conn:
+        return accounts.current_user(conn, session)
+
+
+def current_account(account: dict | None = Depends(optional_account)) -> dict:
+    """The logged-in account. Every buying action requires one."""
     if account is None:
         raise HTTPException(401, "not_logged_in")
     return account
 
 
 @router.post("/accounts", status_code=201)
-def sign_up(body: Credentials, conn: psycopg.Connection = Depends(get_conn)):
-    if accounts.sign_up(conn, body.email, body.password) is None:
-        raise HTTPException(409, "email_taken")
+def sign_up(body: Credentials, pool: ConnectionPool = Depends(get_pool)):
+    with pool.connection() as conn:
+        if accounts.sign_up(conn, body.email, body.password) is None:
+            raise HTTPException(409, "email_taken")
     return {"ok": True}
 
 
 @router.post("/sessions")
-def log_in(body: Credentials, response: Response, conn: psycopg.Connection = Depends(get_conn)):
-    token = accounts.log_in(conn, body.email, body.password)
+def log_in(body: Credentials, response: Response, pool: ConnectionPool = Depends(get_pool)):
+    with pool.connection() as conn:
+        token = accounts.log_in(conn, body.email, body.password)
     if token is None:
         raise HTTPException(401, "wrong_email_or_password")  # don't say which one: no hints for guessers
     # HttpOnly: page scripts can't read it, so injected JavaScript can't steal it.
@@ -64,10 +76,11 @@ def log_in(body: Credentials, response: Response, conn: psycopg.Connection = Dep
 def log_out(
     response: Response,
     session: str | None = Cookie(default=None),
-    conn: psycopg.Connection = Depends(get_conn),
+    pool: ConnectionPool = Depends(get_pool),
 ):
     if session:
-        accounts.log_out(conn, session)  # the token stops working everywhere, right now
+        with pool.connection() as conn:
+            accounts.log_out(conn, session)  # the token stops working everywhere, right now
     response.delete_cookie("session")
     return {"ok": True}
 
@@ -81,20 +94,31 @@ def me(account: dict = Depends(current_account)):
 def verify_id(
     body: IdDocument,
     account: dict = Depends(current_account),
-    conn: psycopg.Connection = Depends(get_conn),
+    pool: ConnectionPool = Depends(get_pool),
 ):
-    if not accounts.verify_id(conn, account["id"], body.id_number):
-        raise HTTPException(409, "id_already_used")  # one real person, one account
+    with pool.connection() as conn:
+        if not accounts.verify_id(conn, account["id"], body.id_number):
+            raise HTTPException(409, "id_already_used")  # one real person, one account
     return {"id_verified": True}
 
 
 # --- Events and the queue ---
 
+# The seat map refreshes every few seconds. For a logged-in buyer, that also counts as
+# "still here", so people choosing seats keep their spot in the room.
 @router.get("/events/{event_id}")
-def get_event(event_id: int, conn: psycopg.Connection = Depends(get_conn)):
-    event = events.get_event(conn, event_id)
+def get_event(
+    event_id: int,
+    account: dict | None = Depends(optional_account),
+    pool: ConnectionPool = Depends(get_pool),
+    r: redis.Redis = Depends(get_redis),
+):
+    with pool.connection() as conn:
+        event = events.get_event(conn, event_id)
     if event is None:
         raise HTTPException(404, "event_not_found")
+    if account is not None:
+        queue.check_in(r, event_id, str(account["id"]))
     return event
 
 
@@ -116,12 +140,13 @@ def queue_status(
     event_id: int,
     body: CaptchaAnswer | None = None,
     account: dict = Depends(current_account),
-    conn: psycopg.Connection = Depends(get_conn),
+    pool: ConnectionPool = Depends(get_pool),
     r: redis.Redis = Depends(get_redis),
 ):
     if not account["id_verified"]:
         raise HTTPException(403, "id_not_verified")
-    state = events.sale_state(conn, event_id)
+    with pool.connection() as conn:
+        state = events.sale_state(conn, event_id)
     if state is None:
         raise HTTPException(404, "event_not_found")
     sale_open, sold_out = state
@@ -129,6 +154,7 @@ def queue_status(
         return {"state": "sold_out", "sale_open": sale_open}
 
     user_id = str(account["id"])
+    queue.check_in(r, event_id, user_id)  # before admitting, so this caller isn't dropped as gone
     if queue.status(r, event_id, user_id)["state"] == "not_in_line":
         if body is None or not captcha.passed(r, body.captcha_id, body.answer):
             raise HTTPException(403, "captcha_required")
@@ -146,15 +172,18 @@ def claim(
     seat_id: int,
     queue_token: str = Header(alias="X-Queue-Token"),
     account: dict = Depends(current_account),
-    conn: psycopg.Connection = Depends(get_conn),
+    pool: ConnectionPool = Depends(get_pool),
     r: redis.Redis = Depends(get_redis),
 ):
-    event_id = seats.seat_event_id(conn, seat_id)
-    if event_id is None:
-        raise HTTPException(404, "seat_not_found")
-    if not queue.token_is_valid(r, queue_token, event_id, str(account["id"])):
-        raise HTTPException(403, "queue_token_invalid")
-    result = seats.claim_seat_within_limit(conn, seat_id, account["id"])
+    user_id = str(account["id"])
+    with pool.connection() as conn:
+        event_id = seats.seat_event_id(conn, seat_id)
+        if event_id is None:
+            raise HTTPException(404, "seat_not_found")
+        queue.check_in(r, event_id, user_id)
+        if not queue.token_is_valid(r, queue_token, event_id, user_id):
+            raise HTTPException(403, "queue_token_invalid")
+        result = seats.claim_seat_within_limit(conn, seat_id, account["id"])
     if result == "limit_reached":
         raise HTTPException(409, "ticket_limit_reached")
     if result == "taken":
@@ -169,20 +198,20 @@ def pay(
     seat_id: int,
     idempotency_key: str = Header(alias="Idempotency-Key"),
     account: dict = Depends(current_account),
-    conn: psycopg.Connection = Depends(get_conn),
+    pool: ConnectionPool = Depends(get_pool),
     bank: MockBank = Depends(get_bank),
     r: redis.Redis = Depends(get_redis),
 ):
     user_id = str(account["id"])
-    price = seats.seat_price(conn, seat_id)
-    if price is None:
-        raise HTTPException(404, "seat_not_found")
-    result = checkout.pay(conn, bank, seat_id, user_id, price, idempotency_key)
-    if result.outcome == checkout.SOLD:
-        queue.leave_room(r, seats.seat_event_id(conn, seat_id), user_id)  # rolling: next person gets in
-    # seconds_left restarts the page's countdown: paying opens a new window. None = no window left.
-    return {
-        "outcome": result.outcome,
-        "attempts_left": result.attempts_left,
-        "seconds_left": seats.seconds_left(conn, seat_id, user_id),
-    }
+    with pool.connection() as conn:
+        price = seats.seat_price(conn, seat_id)
+        if price is None:
+            raise HTTPException(404, "seat_not_found")
+        event_id = seats.seat_event_id(conn, seat_id)
+        queue.check_in(r, event_id, user_id)
+        result = checkout.pay(conn, bank, seat_id, user_id, price, idempotency_key)
+        if result.outcome == checkout.SOLD:
+            queue.leave_room(r, event_id, user_id)  # rolling: next person gets in
+        # seconds_left restarts the page's countdown: paying opens a new window. None = no window left.
+        seconds_left = seats.seconds_left(conn, seat_id, user_id)
+    return {"outcome": result.outcome, "attempts_left": result.attempts_left, "seconds_left": seconds_left}

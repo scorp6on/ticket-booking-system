@@ -8,3 +8,4 @@ node_modules/
 dist/
 .claude/
 docs/
+loadtest/sessions.json

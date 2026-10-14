@@ -6,13 +6,15 @@ import redis
 
 from app.config import settings
 
-# Two Redis sorted sets per event (members are user ids, kept ordered by score):
+# Three Redis sorted sets per event (members are user ids, kept ordered by score):
 #   queue:{event}  the line. Score = place in line; lowest goes first.
 #   room:{event}   people choosing seats. Score = when their token expires (ms).
+#   seen:{event}   last check-in (ms) of everyone in the line or the room. Silence
+#                  for heartbeat_seconds means they left, and their spot is freed.
 
 
-def _keys(event_id: int) -> tuple[str, str]:
-    return f"queue:{event_id}", f"room:{event_id}"
+def _keys(event_id: int) -> tuple[str, str, str]:
+    return f"queue:{event_id}", f"room:{event_id}", f"seen:{event_id}"
 
 
 def _now_ms(r: redis.Redis) -> int:
@@ -23,7 +25,8 @@ def _now_ms(r: redis.Redis) -> int:
 
 def join(r: redis.Redis, event_id: int, user_id: str, sale_open: bool) -> None:
     """Get in line. Joining again keeps your current spot."""
-    queue_key, room_key = _keys(event_id)
+    queue_key, room_key, seen_key = _keys(event_id)
+    r.zadd(seen_key, {user_id: _now_ms(r)})
     if r.zscore(room_key, user_id) is not None:
         return  # already choosing seats
     # Before the sale: a random score below 1 shuffles everyone who came early, so being
@@ -33,12 +36,23 @@ def join(r: redis.Redis, event_id: int, user_id: str, sale_open: bool) -> None:
     r.zadd(queue_key, {user_id: score}, nx=True)  # nx: one spot per user
 
 
+def check_in(r: redis.Redis, event_id: int, user_id: str) -> None:
+    """'Still here.' Any request from someone in the line or the room counts."""
+    r.zadd(_keys(event_id)[2], {user_id: _now_ms(r)}, xx=True)  # xx: only people already tracked
+
+
 # Runs inside Redis as one indivisible step: two callers can never both see
-# "3 spots free" and admit 6 people. Expired tokens leave the room here, so
-# no background job is needed.
+# "3 spots free" and admit 6 people. People who stopped checking in, and expired
+# tokens, leave here, so no background job is needed.
 ADMIT_LUA = """
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local silent_since = now - tonumber(ARGV[3])
+for _, user in ipairs(redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', silent_since)) do
+  redis.call('ZREM', KEYS[1], user)
+  redis.call('ZREM', KEYS[2], user)
+end
+redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', silent_since)
 redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
 local free = tonumber(ARGV[1]) - redis.call('ZCARD', KEYS[2])
 if free > 0 then
@@ -51,18 +65,24 @@ end
 
 
 def admit(r: redis.Redis, event_id: int) -> None:
-    """Rolling admission: fill the room back up to room_size from the front of the line."""
-    r.eval(ADMIT_LUA, 2, *_keys(event_id), settings.room_size, settings.queue_token_seconds * 1000)
+    """Rolling admission: drop people who left, then fill the room back up to room_size
+    from the front of the line."""
+    r.eval(
+        ADMIT_LUA, 3, *_keys(event_id),
+        settings.room_size, settings.queue_token_seconds * 1000, settings.heartbeat_seconds * 1000,
+    )
 
 
 def leave_room(r: redis.Redis, event_id: int, user_id: str) -> None:
     """Free the spot early (they bought a seat) so the next person gets in."""
-    r.zrem(_keys(event_id)[1], user_id)
+    _, room_key, seen_key = _keys(event_id)
+    r.zrem(room_key, user_id)
+    r.zrem(seen_key, user_id)
 
 
 def status(r: redis.Redis, event_id: int, user_id: str) -> dict:
     """Where this user stands: in the room (with a token) or waiting (with a position)."""
-    queue_key, room_key = _keys(event_id)
+    queue_key, room_key, _ = _keys(event_id)
     expires_ms = r.zscore(room_key, user_id)
     if expires_ms is not None:
         expires_ms = int(expires_ms)
