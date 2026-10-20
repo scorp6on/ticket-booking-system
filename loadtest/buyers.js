@@ -10,7 +10,8 @@ import { SharedArray } from "k6/data";
 import { sleep } from "k6";
 import { Counter } from "k6/metrics";
 
-export const BASE = __ENV.BASE_URL || "http://localhost:8000";
+// 127.0.0.1, not localhost: on Windows, "localhost" tries IPv6 first and adds ~200 ms per connection.
+export const BASE = __ENV.BASE_URL || "http://127.0.0.1:8000";
 export const EVENT = __ENV.EVENT_ID;
 const BUYERS = Number(__ENV.BUYERS || 300);
 // Session tokens from setup: everyone logged in before the sale, like real fans.

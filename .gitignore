@@ -11,3 +11,4 @@ docs/
 loadtest/sessions.json
 loadtest/bots.json
 loadtest/summary.json
+loadtest/waiters.json

@@ -3,6 +3,7 @@
     python -m app.loadtest setup 300      # 300 verified, logged-in fans, the bots, a fresh 40-seat event
     python -m app.loadtest check <event>  # after k6 finishes: do the database rows add up?
     python -m app.loadtest bot-test 300   # fans only, then fans + bots, compared; one verdict
+    python -m app.loadtest capacity 5000  # how many people can wait in line before it gets too slow
 """
 import hashlib
 import json
@@ -214,11 +215,66 @@ def bot_test(buyers: int) -> bool:
     return passed
 
 
+# --- Capacity test: how many people can wait in line before it gets too slow? ---
+
+CAPACITY_STEPS = [300, 600, 1000, 1500, 2000, 3000, 4000, 5000]  # people waiting
+WAITERS_FILE = LOADTEST_DIR / "waiters.json"  # waiters' session tokens, read by capacity.js; gitignored
+P95_LIMIT_MS = 3000  # the page asks every 3s: slower answers make it fall behind
+ERROR_LIMIT = 0.01
+
+
+def capacity(max_waiters: int) -> int:
+    """Returns the most people waiting that stayed within the limits (0 if even the first step failed)."""
+    steps = [n for n in CAPACITY_STEPS if n <= max_waiters]
+    with psycopg.connect(settings.database_url) as conn:
+        event_id = create_event(conn, "Capacity Test", 0)  # the sale is already open
+        waiters = _make_accounts(conn, "waiter", steps[-1], hasher.hash(PASSWORD))
+        conn.commit()
+    WAITERS_FILE.write_text(json.dumps([w["token"] for w in waiters]))
+
+    r = redis.Redis.from_url(settings.redis_url)
+    queue_key, room_key, seen_key = f"queue:{event_id}", f"room:{event_id}", f"seen:{event_id}"
+    seconds, micros = r.time()
+    now_ms, hour_ms = seconds * 1000 + micros // 1000, 3600 * 1000
+    # The worst moment of a sale: the room is full and nobody leaves it, so every check
+    # also runs the admission script but lets no one in. (Not in seen:, so never dropped.)
+    r.zadd(room_key, {f"choosing-seats-{n}": now_ms + hour_ms for n in range(settings.room_size)})
+    # Everyone is already in line, in arrival order. Their last check-in is set an hour
+    # ahead so the heartbeat doesn't drop people whose page hasn't started checking in yet;
+    # their first real check-in replaces it.
+    r.zadd(queue_key, {w["user_id"]: now_ms + n for n, w in enumerate(waiters)})
+    r.zadd(seen_key, {w["user_id"]: now_ms + hour_ms for w in waiters})
+    r.close()
+    print(f"{steps[-1]} people waiting in line for event {event_id}, room full. Steps: {steps}")
+
+    summary = LOADTEST_DIR / "summary.json"
+    _k6("capacity.js", summary, {"EVENT_ID": event_id, "STEPS": ",".join(map(str, steps))})
+    metrics = json.loads(summary.read_text())["metrics"]
+
+    print(f"\n=== Capacity (each step: p95 under {P95_LIMIT_MS} ms and errors under {ERROR_LIMIT:.0%}) ===")
+    print(f"{'waiting':>8} {'checks/s':>9} {'median':>8} {'p95':>8} {'errors':>7}")
+    handled, still_ok = 0, True
+    for n in steps:
+        duration, failed = metrics[f"http_req_duration{{waiters:{n}}}"], metrics[f"http_req_failed{{waiters:{n}}}"]
+        ok = duration["p(95)"] < P95_LIMIT_MS and failed["value"] < ERROR_LIMIT
+        print(f"{n:>8} {n / 3:>9.0f} {duration['med']:>6.0f}ms {duration['p(95)']:>6.0f}ms {failed['value']:>7.1%}"
+              f"  {'ok' if ok else 'TOO SLOW' if failed['value'] < ERROR_LIMIT else 'ERRORS'}")
+        still_ok = still_ok and ok  # capacity = the last step before the first failure
+        if still_ok:
+            handled = n
+    dropped = metrics.get("dropped_iterations", {}).get("count", 0)
+    if dropped:
+        print(f"({dropped} checks were never sent: every k6 sender was stuck waiting on slow answers)")
+    print(f"Handled: {handled} people waiting" if handled else "Handled: not even the first step")
+    return handled
+
 if __name__ == "__main__":
     command, arg = sys.argv[1], int(sys.argv[2])
     if command == "setup":
         setup(arg)
     elif command == "bot-test":
         sys.exit(0 if bot_test(arg) else 1)
+    elif command == "capacity":
+        capacity(arg)
     else:
         sys.exit(0 if check(arg) else 1)
