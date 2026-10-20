@@ -9,3 +9,5 @@ dist/
 .claude/
 docs/
 loadtest/sessions.json
+loadtest/bots.json
+loadtest/summary.json

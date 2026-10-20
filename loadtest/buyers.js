@@ -1,15 +1,17 @@
 // Correctness load test: many buyers, all arriving at once, each doing what a real
 // buyer does on the site. Afterwards, `python -m app.loadtest check <event>` checks
 // the database. This script only creates the pressure; the rows are the proof.
+// attack.js reuses the fan from here and adds bots.
 //
 //   k6 run -e EVENT_ID=<id> -e BUYERS=300 loadtest/buyers.js
 import http from "k6/http";
+import exec from "k6/execution";
 import { SharedArray } from "k6/data";
 import { sleep } from "k6";
 import { Counter } from "k6/metrics";
 
-const BASE = __ENV.BASE_URL || "http://localhost:8000";
-const EVENT = __ENV.EVENT_ID;
+export const BASE = __ENV.BASE_URL || "http://localhost:8000";
+export const EVENT = __ENV.EVENT_ID;
 const BUYERS = Number(__ENV.BUYERS || 300);
 // Session tokens from setup: everyone logged in before the sale, like real fans.
 const SESSIONS = new SharedArray("sessions", () => JSON.parse(open("./sessions.json")));
@@ -28,13 +30,13 @@ export const options = {
 };
 
 // k6 keeps cookies per virtual user, so each buyer has their own session, like a browser.
-function post(path, body, headers = {}) {
+export function post(path, body, headers = {}) {
   const json = body === undefined ? null : JSON.stringify(body);
   const h = body === undefined ? headers : { ...headers, "Content-Type": "application/json" };
   return http.post(`${BASE}${path}`, json, { headers: h });
 }
 
-function detail(res) {
+export function detail(res) {
   try {
     return res.json("detail");
   } catch (e) {
@@ -47,17 +49,24 @@ function fail(res) {
   return "error";
 }
 
-// CAPTCHA, join the line, then check our place every 3 seconds.
-// Returns the queue token, or null if the event sold out while we waited.
-function waitForTurn() {
+// Our mock CAPTCHA is solvable by a script; a real one wouldn't be.
+export function solveCaptcha() {
   const c = http.get(`${BASE}/captcha`);
   if (c.status !== 200) {
     fail(c);
     return null;
   }
   const captcha = c.json();
-  const [, a, b] = captcha.question.match(/(\d+) \+ (\d+)/); // our mock is solvable; a real CAPTCHA wouldn't be
-  let res = post(`/events/${EVENT}/queue`, { captcha_id: captcha.captcha_id, answer: String(Number(a) + Number(b)) });
+  const [, a, b] = captcha.question.match(/(\d+) \+ (\d+)/);
+  return { captcha_id: captcha.captcha_id, answer: String(Number(a) + Number(b)) };
+}
+
+// CAPTCHA, join the line, then check our place every `pollSeconds`.
+// Returns the queue token, or null if the event sold out while we waited.
+export function waitForTurn(pollSeconds = POLL_SECONDS) {
+  const captcha = solveCaptcha();
+  if (captcha === null) return null;
+  let res = post(`/events/${EVENT}/queue`, captcha);
   for (;;) {
     if (res.status !== 200) {
       fail(res);
@@ -66,13 +75,13 @@ function waitForTurn() {
     const status = res.json();
     if (status.state === "admitted") return status.token;
     if (status.state === "sold_out") return null;
-    sleep(POLL_SECONDS);
+    sleep(pollSeconds);
     res = post(`/events/${EVENT}/queue`);
   }
 }
 
 // Pick a random open seat, claim it, pay. Another seat if someone beat us to it.
-function buyOneSeat(token) {
+export function buyOneSeat(token) {
   for (;;) {
     const ev = http.get(`${BASE}/events/${EVENT}`);
     if (ev.status !== 200) return fail(ev);
@@ -108,14 +117,16 @@ function buyOneSeat(token) {
   }
 }
 
-export default function () {
+// One fan per iteration: the scenario's iteration number picks their account.
+export function fan() {
   if (!EVENT) throw new Error("Run with -e EVENT_ID=<id printed by: python -m app.loadtest setup>");
-  if (__VU > SESSIONS.length) throw new Error("More BUYERS than setup logged in");
+  const n = exec.scenario.iterationInTest;
+  if (n >= SESSIONS.length) throw new Error("More BUYERS than setup logged in");
 
-  http.cookieJar().set(BASE, "session", SESSIONS[__VU - 1]); // what the browser stored at login
+  http.cookieJar().set(BASE, "session", SESSIONS[n]); // what the browser stored at login
 
   // Buyers want 1 to 4 tickets. Those who want 4 try to go over the limit.
-  let wanted = 1 + (__VU % 4);
+  let wanted = 1 + (n % 4);
   while (wanted > 0) {
     const token = waitForTurn();
     if (token === null) return; // sold out
@@ -124,3 +135,5 @@ export default function () {
     else if (result !== "token_expired") return;
   }
 }
+
+export default fan;

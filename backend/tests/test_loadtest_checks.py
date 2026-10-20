@@ -1,7 +1,8 @@
 import pytest
 
-from app.loadtest import CHECKS, check
+from app.loadtest import BOT_CHECKS, CHECKS, check
 from app.seed import create_event
+from app.services import accounts
 
 # The load test's proof is only as good as its checks. Each test here fakes one way a
 # buyer could be cheated and makes sure the matching check catches it.
@@ -29,10 +30,17 @@ def failing(conn, event_id):
     return [rule for rule, sql in CHECKS.items() if conn.execute(sql, {"event": event_id}).fetchall()]
 
 
+def failing_bot_checks(conn, event_id):
+    return [
+        rule for rule, (sql, bots) in BOT_CHECKS.items()
+        if conn.execute(sql, {"event": event_id, "bots": bots}).fetchall()
+    ]
+
+
 def test_honest_sales_pass(conn, event):
     event_id, seats = event
-    sell(conn, seats[0], "1")
-    sell(conn, seats[1], "2")
+    for n, seat in enumerate(seats):
+        sell(conn, seat, str(n + 1))
     assert failing(conn, event_id) == []
     assert check(event_id) is True
 
@@ -88,3 +96,53 @@ def test_stuck_payment_is_caught(conn, event, status):
     sell(conn, seats[0], "1")
     sell(conn, seats[1], "2", status=status)
     assert "No stuck payments (pending or approved-but-not-captured)" in failing(conn, event_id)
+
+
+# --- Bots (after attack.js) ---
+
+def bot(conn, kind):
+    return str(accounts.sign_up(conn, f"bot-{kind}-1@example.com", "correct-horse"))
+
+
+def sell_the_rest(conn, seats):
+    for n, seat in enumerate(seats):
+        sell(conn, seat, f"fan-{n}")
+
+
+def test_bot_merely_holding_a_seat_is_caught(conn, event):
+    event_id, seats = event
+    sell_the_rest(conn, seats[1:])
+    conn.execute(
+        "UPDATE seats SET status = 'held', held_by = %s, hold_expires_at = now() + interval '5 minutes' WHERE id = %s",
+        (bot(conn, "skipper"), seats[0]),
+    )
+    conn.commit()
+    assert "Line-skipping bots got no seats" in failing_bot_checks(conn, event_id)
+
+
+def test_hammerer_buying_a_seat_is_caught(conn, event):
+    event_id, seats = event
+    sell(conn, seats[0], bot(conn, "hammerer"))
+    sell_the_rest(conn, seats[1:])
+    assert failing_bot_checks(conn, event_id) == ["Queue-hammering bots (arriving after the fans) got no seats"]
+
+
+def test_scalper_with_3_seats_passes_and_4_is_caught(conn, event):
+    event_id, seats = event
+    scalper = bot(conn, "scalper")
+    for seat in seats[:3]:
+        sell(conn, seat, scalper)
+    sell_the_rest(conn, seats[4:])
+    sell(conn, seats[3], "fan-x")
+    assert failing_bot_checks(conn, event_id) == []
+
+    conn.execute("UPDATE payments SET user_id = %s WHERE seat_id = %s", (scalper, seats[3]))
+    conn.execute("UPDATE seats SET held_by = %s WHERE id = %s", (scalper, seats[3]))
+    conn.commit()
+    assert failing_bot_checks(conn, event_id) == ["The scalper's 20 tabs got at most 3 seats"]
+
+
+def test_unsold_seat_is_caught(conn, event):
+    event_id, seats = event
+    sell_the_rest(conn, seats[1:])
+    assert failing_bot_checks(conn, event_id) == ["Every seat sold (bots didn't leave seats stuck)"]
