@@ -194,14 +194,14 @@ def join_line(client, event_id, headers):
 
 
 def test_claim_without_a_queue_token_is_rejected(client, seat_id, buyer):
-    resp = client.post(f"/seats/{seat_id}/claim", headers=buyer("bot")[1])
+    resp = client.post("/carts", headers=buyer("bot")[1], json={"seat_ids": [seat_id]})
     assert resp.status_code == 422
 
 
 def test_claim_with_a_forged_token_is_rejected(client, seat_id, event_id, buyer):
     account_id, cookie = buyer("bot")
     headers = {**cookie, "X-Queue-Token": f"{event_id}:99999999999999:{account_id}:{'0' * 64}"}
-    resp = client.post(f"/seats/{seat_id}/claim", headers=headers)
+    resp = client.post("/carts", headers=headers, json={"seat_ids": [seat_id]})
     assert (resp.status_code, resp.json()) == (403, {"detail": "queue_token_invalid"})
 
 
@@ -255,8 +255,13 @@ def test_queue_to_seat_end_to_end(client, event_id, seat_id, buyer):
     assert status["state"] == "admitted"
     assert status["seconds_left"] == settings.queue_token_seconds
 
-    resp = client.post(f"/seats/{seat_id}/claim", headers={**cookie, "X-Queue-Token": status["token"]})
-    assert resp.status_code == 200
+    resp = client.post("/carts", headers={**cookie, "X-Queue-Token": status["token"]}, json={"seat_ids": [seat_id]})
+    assert resp.status_code == 201
+
+
+def buy(client, headers, token, seat_id):
+    cart_id = client.post("/carts", headers={**headers, "X-Queue-Token": token}, json={"seat_ids": [seat_id]}).json()["cart_id"]
+    client.post(f"/carts/{cart_id}/pay", headers={**headers, "Idempotency-Key": "k1"}, json={"seat_ids": [seat_id]})
 
 
 def test_line_is_told_when_sold_out(client, monkeypatch, event_id, seat_id, buyer):
@@ -265,8 +270,7 @@ def test_line_is_told_when_sold_out(client, monkeypatch, event_id, seat_id, buye
     token = join_line(client, event_id, alice)["token"]
     assert join_line(client, event_id, bob) == {"state": "waiting", "position": 1, "sale_open": True}
 
-    client.post(f"/seats/{seat_id}/claim", headers={**alice, "X-Queue-Token": token})
-    client.post(f"/seats/{seat_id}/pay", headers={**alice, "Idempotency-Key": "k1"})
+    buy(client, alice, token, seat_id)
 
     # The only seat is sold, so Bob is told instead of waiting forever.
     assert join_line(client, event_id, bob) == {"state": "sold_out", "sale_open": True}
@@ -280,8 +284,7 @@ def test_purchase_frees_a_room_spot(client, conn, monkeypatch, event_id, seat_id
     token = join_line(client, event_id, alice)["token"]
     join_line(client, event_id, bob)
 
-    client.post(f"/seats/{seat_id}/claim", headers={**alice, "X-Queue-Token": token})
-    client.post(f"/seats/{seat_id}/pay", headers={**alice, "Idempotency-Key": "k1"})
+    buy(client, alice, token, seat_id)
 
     assert client.post(f"/events/{event_id}/queue", headers=bob).json()["state"] == "admitted"
 

@@ -86,23 +86,27 @@ def setup(buyers: int) -> tuple[int, int]:
 
 
 # Each query lists the rows that break a rule. A passing test finds none.
+# A payment covers a cart; the seats it bought are the cart's sold seats.
 CHECKS = {
     "Every sold seat has exactly one captured payment (no double-sale, no free seat)": """
         SELECT s.label FROM seats s
         WHERE s.event_id = %(event)s AND s.status = 'sold'
-          AND (SELECT count(*) FROM payments p WHERE p.seat_id = s.id AND p.status = 'captured') <> 1
+          AND (SELECT count(*) FROM payments p WHERE p.cart_id = s.cart_id AND p.status = 'captured') <> 1
     """,
     "No charge without a seat": """
-        SELECT p.id FROM payments p JOIN seats s ON s.id = p.seat_id
-        WHERE s.event_id = %(event)s AND p.status = 'captured' AND s.status <> 'sold'
+        SELECT p.id FROM payments p JOIN carts c ON c.id = p.cart_id
+        WHERE c.event_id = %(event)s AND p.status = 'captured'
+          AND NOT EXISTS (SELECT 1 FROM seats s WHERE s.cart_id = p.cart_id AND s.status = 'sold')
     """,
     "The person who paid is the person who got the seat": """
-        SELECT p.id FROM payments p JOIN seats s ON s.id = p.seat_id
-        WHERE s.event_id = %(event)s AND p.status = 'captured' AND p.user_id IS DISTINCT FROM s.held_by
+        SELECT p.id FROM payments p JOIN seats s ON s.cart_id = p.cart_id
+        WHERE s.event_id = %(event)s AND p.status = 'captured' AND s.status = 'sold'
+          AND p.user_id IS DISTINCT FROM s.held_by
     """,
-    "Charged the seat's price": """
-        SELECT p.id FROM payments p JOIN seats s ON s.id = p.seat_id
-        WHERE s.event_id = %(event)s AND p.status = 'captured' AND p.amount_cents <> s.price_cents
+    "Charged the seats' price": """
+        SELECT p.id FROM payments p JOIN carts c ON c.id = p.cart_id
+        WHERE c.event_id = %(event)s AND p.status = 'captured'
+          AND p.amount_cents <> (SELECT sum(price_cents) FROM seats s WHERE s.cart_id = p.cart_id AND s.status = 'sold')
     """,
     "No buyer has more than 3 seats": """
         SELECT held_by FROM seats
@@ -110,8 +114,8 @@ CHECKS = {
         GROUP BY held_by HAVING count(*) > 3
     """,
     "No stuck payments (pending or approved-but-not-captured)": """
-        SELECT p.id FROM payments p JOIN seats s ON s.id = p.seat_id
-        WHERE s.event_id = %(event)s AND p.status IN ('pending', 'approved')
+        SELECT p.id FROM payments p JOIN carts c ON c.id = p.cart_id
+        WHERE c.event_id = %(event)s AND p.status IN ('pending', 'approved')
     """,
 }
 
@@ -120,8 +124,8 @@ BOT_TRACES_SQL = """
     SELECT s.label FROM seats s JOIN users u ON s.held_by = u.id::text
     WHERE s.event_id = %(event)s AND u.email LIKE %(bots)s
     UNION ALL
-    SELECT 'payment ' || p.id FROM payments p JOIN seats s ON s.id = p.seat_id JOIN users u ON p.user_id = u.id::text
-    WHERE s.event_id = %(event)s AND u.email LIKE %(bots)s
+    SELECT 'payment ' || p.id FROM payments p JOIN carts c ON c.id = p.cart_id JOIN users u ON p.user_id = u.id::text
+    WHERE c.event_id = %(event)s AND u.email LIKE %(bots)s
 """
 BOT_CHECKS = {
     "Line-skipping bots got no seats": (BOT_TRACES_SQL, "bot-skipper-%"),
@@ -147,8 +151,8 @@ def check(event_id: int) -> bool:
             params,
         ).fetchone()
         payments = conn.execute(
-            "SELECT p.status, count(*) FROM payments p JOIN seats s ON s.id = p.seat_id "
-            "WHERE s.event_id = %(event)s GROUP BY p.status ORDER BY p.status",
+            "SELECT p.status, count(*) FROM payments p JOIN carts c ON c.id = p.cart_id "
+            "WHERE c.event_id = %(event)s GROUP BY p.status ORDER BY p.status",
             params,
         ).fetchall()
         print(f"Event {event_id}: {sold}/{total} seats sold to {buyers} buyers")

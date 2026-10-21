@@ -16,12 +16,18 @@ def event(conn):
 
 
 def sell(conn, seat_id, buyer, payments=1, amount=None, status="captured"):
-    conn.execute("UPDATE seats SET status = 'sold', held_by = %s WHERE id = %s", (buyer, seat_id))
+    """The buyer bought this seat in a cart of one."""
+    cart_id = conn.execute(
+        "INSERT INTO carts (user_id, event_id, expires_at) SELECT %s, event_id, now() FROM seats WHERE id = %s "
+        "RETURNING id",
+        (buyer, seat_id),
+    ).fetchone()[0]
+    conn.execute("UPDATE seats SET status = 'sold', held_by = %s, cart_id = %s WHERE id = %s", (buyer, cart_id, seat_id))
     for n in range(payments):
         conn.execute(
-            "INSERT INTO payments (seat_id, user_id, amount_cents, idempotency_key, status) "
-            "SELECT id, %s, COALESCE(%s, price_cents), %s, %s FROM seats WHERE id = %s",
-            (buyer, amount, f"{seat_id}-{buyer}-{n}", status, seat_id),
+            "INSERT INTO payments (cart_id, user_id, amount_cents, idempotency_key, status) "
+            "SELECT %s, %s, COALESCE(%s, price_cents), %s, %s FROM seats WHERE id = %s",
+            (cart_id, buyer, amount, f"{seat_id}-{buyer}-{n}", status, seat_id),
         )
     conn.commit()
 
@@ -80,7 +86,7 @@ def test_wrong_person_is_caught(conn, event):
 def test_wrong_amount_is_caught(conn, event):
     event_id, seats = event
     sell(conn, seats[0], "1", amount=1)
-    assert failing(conn, event_id) == ["Charged the seat's price"]
+    assert failing(conn, event_id) == ["Charged the seats' price"]
 
 
 def test_fourth_seat_is_caught(conn, event):
@@ -136,7 +142,9 @@ def test_scalper_with_3_seats_passes_and_4_is_caught(conn, event):
     sell(conn, seats[3], "fan-x")
     assert failing_bot_checks(conn, event_id) == []
 
-    conn.execute("UPDATE payments SET user_id = %s WHERE seat_id = %s", (scalper, seats[3]))
+    conn.execute(
+        "UPDATE payments SET user_id = %s WHERE cart_id = (SELECT cart_id FROM seats WHERE id = %s)", (scalper, seats[3])
+    )
     conn.execute("UPDATE seats SET held_by = %s WHERE id = %s", (scalper, seats[3]))
     conn.commit()
     assert failing_bot_checks(conn, event_id) == ["The scalper's 20 tabs got at most 3 seats"]

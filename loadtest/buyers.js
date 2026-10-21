@@ -21,6 +21,7 @@ const POLL_SECONDS = 3; // same as the page
 const bought = new Counter("seats_bought");
 const seatTaken = new Counter("seat_taken");
 const limitReached = new Counter("ticket_limit_reached");
+const cartActive = new Counter("cart_active");
 const unexpected = new Counter("unexpected_responses");
 
 export const options = {
@@ -96,7 +97,8 @@ export function buyOneSeat(token) {
     }
     const seat = open[Math.floor(Math.random() * open.length)];
 
-    const claim = post(`/seats/${seat.id}/claim`, undefined, { "X-Queue-Token": token });
+    // A cart of one seat.
+    const claim = post("/carts", { seat_ids: [seat.id] }, { "X-Queue-Token": token });
     if (claim.status === 409 && detail(claim) === "seat_taken") {
       seatTaken.add(1);
       continue;
@@ -105,11 +107,16 @@ export function buyOneSeat(token) {
       limitReached.add(1);
       return "limit";
     }
+    if (claim.status === 409 && detail(claim) === "cart_active") {
+      cartActive.add(1); // another tab of the same account is mid-purchase
+      return "cart_active";
+    }
     if (claim.status === 403 && detail(claim) === "queue_token_invalid") return "token_expired";
-    if (claim.status !== 200) return fail(claim);
+    if (claim.status !== 201) return fail(claim);
 
     const key = `${__VU}-${seat.id}-${Date.now()}-${Math.random()}`; // a new key per press of Pay
-    const pay = post(`/seats/${seat.id}/pay`, undefined, { "Idempotency-Key": key });
+    const cartId = claim.json("cart_id");
+    const pay = post(`/carts/${cartId}/pay`, { seat_ids: [seat.id] }, { "Idempotency-Key": key });
     if (pay.status === 200 && pay.json("outcome") === "sold") {
       bought.add(1);
       return "sold";

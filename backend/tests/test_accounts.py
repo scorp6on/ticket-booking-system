@@ -5,7 +5,7 @@ import pytest
 
 from app.config import settings
 from app.services import accounts
-from app.services.seats import claim_seat_within_limit
+from app.services.carts import add_seat, hold_seats
 
 CREDS = {"email": "alice@example.com", "password": "correct-horse"}
 
@@ -129,32 +129,43 @@ def alice_id(conn):
     return accounts.sign_up(conn, "alice@example.com", "correct-horse")
 
 
-def test_fourth_seat_is_refused(conn, six_seats, alice_id):
-    results = [claim_seat_within_limit(conn, s, alice_id) for s in six_seats[:4]]
-    assert results == ["held", "held", "held", "limit_reached"]
+def expire_carts(conn):
+    conn.execute("UPDATE carts SET expires_at = now() - interval '1 second'")
+    conn.execute("UPDATE seats SET hold_expires_at = now() - interval '1 second' WHERE status = 'held'")
+    conn.commit()
 
 
-def test_held_and_sold_seats_both_count(conn, six_seats, alice_id):
-    claim_seat_within_limit(conn, six_seats[0], alice_id)
-    claim_seat_within_limit(conn, six_seats[1], alice_id)
+def test_fourth_seat_is_refused(conn, event_id, six_seats, alice_id):
+    cart = hold_seats(conn, alice_id, event_id, six_seats[:3]).cart_id
+    assert add_seat(conn, alice_id, cart, six_seats[3]) == "limit_reached"
+    assert hold_seats(conn, alice_id, event_id, six_seats[3:4]).outcome == "cart_active"
+
+
+def test_cart_bigger_than_the_limit_is_refused(conn, event_id, six_seats, alice_id):
+    assert hold_seats(conn, alice_id, event_id, six_seats[:4]).outcome == "limit_reached"
+    assert conn.execute("SELECT count(*) FROM seats WHERE held_by IS NOT NULL").fetchone()[0] == 0
+
+
+def test_held_and_sold_seats_both_count(conn, event_id, six_seats, alice_id):
+    hold_seats(conn, alice_id, event_id, six_seats[:2])
     conn.execute("UPDATE seats SET status = 'sold', hold_expires_at = NULL WHERE id = %s", (six_seats[0],))
     conn.commit()
-    assert claim_seat_within_limit(conn, six_seats[2], alice_id) == "held"
-    assert claim_seat_within_limit(conn, six_seats[3], alice_id) == "limit_reached"
+    expire_carts(conn)  # the unsold seat's hold ran out
+    assert hold_seats(conn, alice_id, event_id, six_seats[2:5]).outcome == "limit_reached"  # 1 sold + 3
+    assert hold_seats(conn, alice_id, event_id, six_seats[2:4]).outcome == "held"  # 1 sold + 2
 
 
-def test_expired_holds_dont_count(conn, six_seats, alice_id):
-    for s in six_seats[:3]:
-        claim_seat_within_limit(conn, s, alice_id)
-    conn.execute("UPDATE seats SET hold_expires_at = now() - interval '1 second' WHERE id = %s", (six_seats[0],))
+def test_expired_holds_dont_count(conn, event_id, six_seats, alice_id):
+    hold_seats(conn, alice_id, event_id, six_seats[:3])
+    expire_carts(conn)
+    assert hold_seats(conn, alice_id, event_id, six_seats[3:6]).outcome == "held"
+
+
+def test_four_tabs_at_once_cannot_beat_the_limit(conn, event_id, six_seats, alice_id):
+    # Alice already bought 2 seats, then clicks 4 more in 4 tabs at the same instant.
+    hold_seats(conn, alice_id, event_id, six_seats[:2])
+    conn.execute("UPDATE seats SET status = 'sold', hold_expires_at = NULL WHERE held_by = %s", (str(alice_id),))
     conn.commit()
-    assert claim_seat_within_limit(conn, six_seats[3], alice_id) == "held"
-
-
-def test_four_tabs_at_once_cannot_beat_the_limit(conn, six_seats, alice_id):
-    # Alice already holds 2 seats, then clicks 4 more in 4 tabs at the same instant.
-    claim_seat_within_limit(conn, six_seats[0], alice_id)
-    claim_seat_within_limit(conn, six_seats[1], alice_id)
     tabs = 4
     start_line = threading.Barrier(tabs)
     results = []
@@ -162,7 +173,7 @@ def test_four_tabs_at_once_cannot_beat_the_limit(conn, six_seats, alice_id):
     def tab(seat_id):
         with psycopg.connect(settings.database_url) as c:
             start_line.wait()
-            results.append(claim_seat_within_limit(c, seat_id, alice_id))
+            results.append(hold_seats(c, alice_id, event_id, [seat_id]).outcome)
 
     threads = [threading.Thread(target=tab, args=(s,)) for s in six_seats[2:]]
     for t in threads:
@@ -170,13 +181,15 @@ def test_four_tabs_at_once_cannot_beat_the_limit(conn, six_seats, alice_id):
     for t in threads:
         t.join()
 
-    assert sorted(results) == ["held", "limit_reached", "limit_reached", "limit_reached"]
-    held = conn.execute("SELECT count(*) FROM seats WHERE held_by = %s", (str(alice_id),)).fetchone()[0]
-    assert held == 3
+    assert sorted(results) == ["cart_active"] * 3 + ["held"]
+    owned = conn.execute("SELECT count(*) FROM seats WHERE held_by = %s", (str(alice_id),)).fetchone()[0]
+    assert owned == 3
 
 
 def test_limit_through_the_api(client, event_id, six_seats, admitted):
-    for s in six_seats[:3]:
-        assert client.post(f"/seats/{s}/claim", headers=admitted("alice")).status_code == 200
-    resp = client.post(f"/seats/{six_seats[3]}/claim", headers=admitted("alice"))
+    resp = client.post("/carts", headers=admitted("alice"), json={"seat_ids": six_seats[:4]})
+    assert resp.status_code == 422  # a cart holds at most 3
+
+    cart_id = client.post("/carts", headers=admitted("alice"), json={"seat_ids": six_seats[:3]}).json()["cart_id"]
+    resp = client.post(f"/carts/{cart_id}/seats", headers=admitted("alice"), json={"seat_id": six_seats[3]})
     assert (resp.status_code, resp.json()) == (409, {"detail": "ticket_limit_reached"})

@@ -84,7 +84,7 @@ function openSeats() {
 }
 
 function result(kind, res) {
-  if (res.status === 200) gotThrough.add(1, { kind });
+  if (res.status === 200 || res.status === 201) gotThrough.add(1, { kind });
   else refused.add(1, { kind, detail: String(detail(res)) });
 }
 
@@ -95,7 +95,7 @@ function attackSeats(kind, headersFor) {
     const open = openSeats();
     if (open.length === 0 && Date.now() > OPENS_AT + 30 * 1000) return; // sold out (or all held)
     for (const seat of open.slice(0, 3)) {
-      result(kind, post(`/seats/${seat.id}/claim`, undefined, headersFor()));
+      result(kind, post("/carts", { seat_ids: [seat.id] }, headersFor()));
     }
     sleep(0.5);
   }

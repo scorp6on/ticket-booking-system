@@ -3,9 +3,8 @@ from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Response
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, Field
 
-from app.config import settings
 from app.db import get_pool, get_redis
-from app.services import accounts, captcha, checkout, events, queue, seats
+from app.services import accounts, captcha, carts, checkout, events, queue
 from app.services.bank import MockBank
 
 router = APIRouter()
@@ -166,10 +165,38 @@ def queue_status(
 
 # --- Buying ---
 
+class HoldRequest(BaseModel):
+    seat_ids: list[int] = Field(min_length=1, max_length=carts.TICKET_LIMIT)
+
+
+class AddSeatRequest(BaseModel):
+    seat_id: int
+
+
+class PayRequest(BaseModel):
+    seat_ids: list[int] = Field(min_length=1, max_length=carts.TICKET_LIMIT)  # the seats on the buyer's screen
+
+
+ADD_SEAT_ERRORS = {
+    "not_found": (404, "cart_not_found"),
+    "cart_expired": (409, "cart_expired"),
+    "cart_locked": (409, "cart_locked"),
+    "limit_reached": (409, "ticket_limit_reached"),
+    "taken": (409, "seat_taken"),
+}
+
+
+def _check_queue_token(r: redis.Redis, queue_token: str, event_id: int, user_id: str) -> None:
+    queue.check_in(r, event_id, user_id)
+    if not queue.token_is_valid(r, queue_token, event_id, user_id):
+        raise HTTPException(403, "queue_token_invalid")
+
+
 # X-Queue-Token proves this buyer waited their turn; calling the API directly doesn't skip the line.
-@router.post("/seats/{seat_id}/claim")
-def claim(
-    seat_id: int,
+# Seats someone else got first come back in "taken", so the buyer can pick others.
+@router.post("/carts", status_code=201)
+def hold(
+    body: HoldRequest,
     queue_token: str = Header(alias="X-Queue-Token"),
     account: dict = Depends(current_account),
     pool: ConnectionPool = Depends(get_pool),
@@ -177,25 +204,52 @@ def claim(
 ):
     user_id = str(account["id"])
     with pool.connection() as conn:
-        event_id = seats.seat_event_id(conn, seat_id)
+        event_id = carts.seats_event_id(conn, body.seat_ids)
         if event_id is None:
-            raise HTTPException(404, "seat_not_found")
-        queue.check_in(r, event_id, user_id)
-        if not queue.token_is_valid(r, queue_token, event_id, user_id):
-            raise HTTPException(403, "queue_token_invalid")
-        result = seats.claim_seat_within_limit(conn, seat_id, account["id"])
-    if result == "limit_reached":
+            raise HTTPException(404, "seat_not_found")  # unknown seat, or seats from different events
+        _check_queue_token(r, queue_token, event_id, user_id)
+        result = carts.hold_seats(conn, account["id"], event_id, body.seat_ids)
+        seconds_left = None if result.cart_id is None else carts.seconds_left(conn, account["id"], result.cart_id)
+    if result.outcome == "cart_active":
+        raise HTTPException(409, "cart_active")
+    if result.outcome == "limit_reached":
         raise HTTPException(409, "ticket_limit_reached")
-    if result == "taken":
-        raise HTTPException(409, "seat_taken")
-    return {"seconds_left": settings.hold_seconds}
+    if result.outcome == "taken":
+        raise HTTPException(409, "seat_taken")  # every seat asked for was taken
+    return {"cart_id": result.cart_id, "held": result.held, "taken": result.taken, "seconds_left": seconds_left}
+
+
+# A replacement for a seat that was taken. It ends at the cart's deadline.
+@router.post("/carts/{cart_id}/seats")
+def add_seat(
+    cart_id: int,
+    body: AddSeatRequest,
+    queue_token: str = Header(alias="X-Queue-Token"),
+    account: dict = Depends(current_account),
+    pool: ConnectionPool = Depends(get_pool),
+    r: redis.Redis = Depends(get_redis),
+):
+    user_id = str(account["id"])
+    with pool.connection() as conn:
+        event_id = carts.cart_event_id(conn, cart_id)
+        if event_id is None:
+            raise HTTPException(404, "cart_not_found")
+        if carts.seats_event_id(conn, [body.seat_id]) != event_id:
+            raise HTTPException(404, "seat_not_found")
+        _check_queue_token(r, queue_token, event_id, user_id)
+        outcome = carts.add_seat(conn, account["id"], cart_id, body.seat_id)
+        seconds_left = carts.seconds_left(conn, account["id"], cart_id)
+    if outcome in ADD_SEAT_ERRORS:
+        raise HTTPException(*ADD_SEAT_ERRORS[outcome])
+    return {"seconds_left": seconds_left}
 
 
 # Used for the first try and every retry; a retry just sends a new Idempotency-Key.
 # No amount in the request: the price comes from our database.
-@router.post("/seats/{seat_id}/pay")
+@router.post("/carts/{cart_id}/pay")
 def pay(
-    seat_id: int,
+    cart_id: int,
+    body: PayRequest,
     idempotency_key: str = Header(alias="Idempotency-Key"),
     account: dict = Depends(current_account),
     pool: ConnectionPool = Depends(get_pool),
@@ -204,14 +258,18 @@ def pay(
 ):
     user_id = str(account["id"])
     with pool.connection() as conn:
-        price = seats.seat_price(conn, seat_id)
-        if price is None:
-            raise HTTPException(404, "seat_not_found")
-        event_id = seats.seat_event_id(conn, seat_id)
+        event_id = carts.cart_event_id(conn, cart_id)
+        if event_id is None:
+            raise HTTPException(404, "cart_not_found")
         queue.check_in(r, event_id, user_id)
-        result = checkout.pay(conn, bank, seat_id, user_id, price, idempotency_key)
+        result = checkout.pay(conn, bank, account["id"], cart_id, body.seat_ids, idempotency_key)
         if result.outcome == checkout.SOLD:
             queue.leave_room(r, event_id, user_id)  # rolling: next person gets in
         # seconds_left restarts the page's countdown: paying opens a new window. None = no window left.
-        seconds_left = seats.seconds_left(conn, seat_id, user_id)
-    return {"outcome": result.outcome, "attempts_left": result.attempts_left, "seconds_left": seconds_left}
+        seconds_left = carts.seconds_left(conn, account["id"], cart_id)
+    return {
+        "outcome": result.outcome,
+        "attempts_left": result.attempts_left,
+        "seconds_left": seconds_left,
+        "expired_seat_ids": result.expired_seat_ids,
+    }

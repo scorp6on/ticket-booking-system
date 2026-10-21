@@ -8,15 +8,15 @@ from app.services.bank import MockBank
 from app.services.payments import create_payment
 
 
-def make_stuck_payment(conn, seat_id, key):
-    payment_id, _ = create_payment(conn, seat_id, f"user-{key}", 4999, key)
+def make_stuck_payment(conn, cart_id, key):
+    payment_id, _ = create_payment(conn, cart_id, f"user-{key}", 4999, key)
     conn.execute("UPDATE payments SET created_at = now() - interval '6 minutes' WHERE id = %s", (payment_id,))
     conn.commit()
     return payment_id
 
 
-def test_job_releases_the_money_at_the_bank(seat_id, conn):
-    stuck = make_stuck_payment(conn, seat_id, "k1")
+def test_job_releases_the_money_at_the_bank(conn, new_cart):
+    stuck = make_stuck_payment(conn, new_cart(), "k1")
     bank = MockBank(replies=[])
 
     assert void_stuck_once(conn, bank) == [stuck]
@@ -25,8 +25,8 @@ def test_job_releases_the_money_at_the_bank(seat_id, conn):
     assert bank.voided == [stuck]
 
 
-def test_two_servers_running_the_job_never_void_twice(seat_id, conn):
-    stuck = {make_stuck_payment(conn, seat_id, f"k{n}") for n in range(10)}
+def test_two_servers_running_the_job_never_void_twice(conn, new_cart):
+    stuck = {make_stuck_payment(conn, new_cart(f"user-k{n}"), f"k{n}") for n in range(10)}
     bank = MockBank(replies=[])
     servers = 2
     start_line = threading.Barrier(servers)

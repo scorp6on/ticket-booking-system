@@ -18,7 +18,7 @@ SCHEMA = (Path(__file__).parent.parent / "app" / "schema.sql").read_text()
 def conn():
     with psycopg.connect(settings.database_url) as c:
         # Rebuild from scratch so schema changes always apply (wipes local data).
-        c.execute("DROP TABLE IF EXISTS payments, seats, events, sessions, users")
+        c.execute("DROP TABLE IF EXISTS payments, seats, carts, events, sessions, users")
         c.execute(SCHEMA)
         c.commit()
         yield c
@@ -99,3 +99,43 @@ def paying(buyer):
             h["Idempotency-Key"] = key
         return h
     return headers
+
+
+@pytest.fixture
+def account(conn):
+    """User rows by name, skipping the slow password hashing: account("alice") -> account id."""
+    made = {}
+
+    def get(name):
+        if name not in made:
+            made[name] = conn.execute(
+                "INSERT INTO users (email, password_hash) VALUES (%s, 'not-a-real-hash') RETURNING id",
+                (f"{name}@example.com",),
+            ).fetchone()[0]
+            conn.commit()
+        return made[name]
+
+    return get
+
+
+@pytest.fixture
+def new_cart(conn, event_id):
+    """A bare cart row, for tests of payments alone: new_cart("alice") -> cart id."""
+    def make(user_id="alice"):
+        cart_id = conn.execute(
+            "INSERT INTO carts (user_id, event_id, expires_at) VALUES (%s, %s, now() + interval '5 minutes') "
+            "RETURNING id",
+            (user_id, event_id),
+        ).fetchone()[0]
+        conn.commit()
+        return cart_id
+    return make
+
+
+@pytest.fixture
+def seats(conn, event_id, seat_id):
+    """Six open seats in the test event: '14B' plus A1-A5."""
+    for n in range(1, 6):
+        conn.execute("INSERT INTO seats (event_id, label, price_cents) VALUES (%s, %s, 4999)", (event_id, f"A{n}"))
+    conn.commit()
+    return [r[0] for r in conn.execute("SELECT id FROM seats WHERE event_id = %s ORDER BY id", (event_id,))]

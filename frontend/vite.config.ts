@@ -8,7 +8,7 @@ export default defineConfig({
   server: {
     proxy: {
       "/api": {
-        target: "http://localhost:8000",
+        target: "http://127.0.0.1:8000", // not localhost: on Windows it tries IPv6 first (~200 ms per connection)
         rewrite: (path) => path.replace(/^\/api/, ""),
       },
     },

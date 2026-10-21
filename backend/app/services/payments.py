@@ -10,10 +10,10 @@ from app.config import settings
 # to move FROM, so if something else moved the payment first, we get 0 rows.
 
 # ON CONFLICT DO NOTHING covers both unique rules: a repeated idempotency key,
-# and a second pending payment from the same buyer for the same seat.
+# and a second pending payment for the same cart.
 CREATE_PAYMENT_SQL = """
-INSERT INTO payments (seat_id, user_id, amount_cents, idempotency_key)
-VALUES (%(seat_id)s, %(user_id)s, %(amount_cents)s, %(key)s)
+INSERT INTO payments (cart_id, user_id, amount_cents, idempotency_key)
+VALUES (%(cart_id)s, %(user_id)s, %(amount_cents)s, %(key)s)
 ON CONFLICT DO NOTHING
 RETURNING id
 """
@@ -21,7 +21,7 @@ RETURNING id
 
 def create_payment(
     conn: psycopg.Connection,
-    seat_id: int,
+    cart_id: int,
     user_id: str,
     amount_cents: int,
     idempotency_key: str,
@@ -30,12 +30,12 @@ def create_payment(
 
     Returns (payment_id, True) if this is a new attempt: go ask the bank.
     Returns (payment_id, False) if this key was seen before: return the saved result, don't ask again.
-    Returns None if another payment for this seat is still waiting on the bank.
+    Returns None if another payment for this cart is still waiting on the bank.
     """
     with conn.cursor() as cur:
         cur.execute(
             CREATE_PAYMENT_SQL,
-            {"seat_id": seat_id, "user_id": user_id, "amount_cents": amount_cents, "key": idempotency_key},
+            {"cart_id": cart_id, "user_id": user_id, "amount_cents": amount_cents, "key": idempotency_key},
         )
         row = cur.fetchone()
         if row is None:

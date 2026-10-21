@@ -21,13 +21,17 @@ export type PayOutcome =
   | "no_reply"
   | "expired"
   | "not_holder"
+  | "cart_changed"
   | "in_progress";
 
 export type PayResult = {
   outcome: PayOutcome;
   attempts_left: number | null;
   seconds_left: number | null;
+  expired_seat_ids: number[]; // seats on screen that are no longer held
 };
+
+export type HoldResult = { cart_id: number; held: number[]; taken: number[]; seconds_left: number };
 
 export type QueueStatus =
   | { state: "waiting"; position: number; sale_open: boolean }
@@ -42,6 +46,12 @@ export class ApiError extends Error {
     super(detail);
   }
 }
+
+/** The session ended (logged out elsewhere, or expired): the page should ask to log in again. */
+export const isLoggedOut = (e: unknown) => e instanceof ApiError && e.status === 401;
+
+/** No answer, or the server failed: likely brief, so keep the page and try again. */
+export const isConnectionProblem = (e: unknown) => !(e instanceof ApiError) || e.status >= 500;
 
 // The session cookie is HttpOnly: this code never sees it. The browser attaches it
 // to every request automatically, so nothing here sends a user id.
@@ -68,13 +78,18 @@ export const getEvent = (eventId: number) => call<Event>("GET", `/events/${event
 export const queueStatus = (eventId: number, captcha?: { captcha_id: string; answer: string }) =>
   call<QueueStatus>("POST", `/events/${eventId}/queue`, captcha);
 
-/** Returns seconds left on the hold. Throws ApiError "seat_taken", "ticket_limit_reached",
- * or "queue_token_invalid" (our time to pick a seat ran out). */
-export const claimSeat = async (seatId: number, queueToken: string) =>
-  (await call<{ seconds_left: number }>("POST", `/seats/${seatId}/claim`, undefined, { "X-Queue-Token": queueToken }))
+/** Holds the seats we win; `taken` lists the ones someone else got. Throws ApiError "seat_taken"
+ * (all of them), "ticket_limit_reached", "cart_active", or "queue_token_invalid" (our time to pick ran out). */
+export const holdSeats = (seatIds: number[], queueToken: string) =>
+  call<HoldResult>("POST", "/carts", { seat_ids: seatIds }, { "X-Queue-Token": queueToken });
+
+/** Adds a replacement seat; it ends at the cart's deadline. Returns seconds left on the cart.
+ * Throws ApiError "seat_taken", "ticket_limit_reached", "cart_expired", "cart_locked" or "queue_token_invalid". */
+export const addSeat = async (cartId: number, seatId: number, queueToken: string) =>
+  (await call<{ seconds_left: number }>("POST", `/carts/${cartId}/seats`, { seat_id: seatId }, { "X-Queue-Token": queueToken }))
     .seconds_left;
 
 /** One call per press of Pay. A new key each press: a retry after a decline is a new request.
- * No amount is sent: the server decides the price. */
-export const pay = (seatId: number) =>
-  call<PayResult>("POST", `/seats/${seatId}/pay`, undefined, { "Idempotency-Key": crypto.randomUUID() });
+ * Sends the seats on screen so the server can tell if they changed. No amount: the server decides the price. */
+export const payCart = (cartId: number, seatIds: number[]) =>
+  call<PayResult>("POST", `/carts/${cartId}/pay`, { seat_ids: seatIds }, { "Idempotency-Key": crypto.randomUUID() });
